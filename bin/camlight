@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# Switch a UVC camera between lighting profiles, or set individual
+# controls by hand.
+#
+# Controls are applied live with v4l2-ctl, so nothing here interrupts camshare —
+# UVC controls can be changed mid-stream. The result is remembered and reapplied
+# by camshare.sh at startup, because cold plugs and guvcview reset UVC controls
+# to their defaults.
+set -uo pipefail
+
+HERE=$(dirname "$(readlink -f "$0")")
+# shellcheck source=/dev/null
+. "$HERE/camshare-conf"
+camshare_conf_load || true
+
+CAM=${CAM:-$(camshare_cam)}       # stable symlink created by the udev rule
+STATE_DIR=${CAMLIGHT_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/camshare}
+PROFILE_FILE=$STATE_DIR/profile   # one line: the base profile, day | evening | auto
+CUSTOM_FILE=$STATE_DIR/custom     # control=value lines layered on top; absent if none
+
+# Controls are always applied in this order. The auto_* toggles must be written
+# before the manual values they gate, or those values are rejected and read back
+# flagged inactive. Anything not listed here is not a control this script sets.
+ORDER=(
+    brightness contrast saturation hue sharpness power_line_frequency
+    auto_exposure exposure_time_absolute
+    white_balance_automatic white_balance_temperature
+    focus_automatic_continuous focus_absolute
+    zoom_absolute
+)
+
+# Setting a manual value while its auto counterpart is on silently does nothing,
+# so turning the auto off is implied. Format: manual_control:auto_control:off_value
+IMPLIES=(
+    exposure_time_absolute:auto_exposure:1
+    white_balance_temperature:white_balance_automatic:0
+    focus_absolute:focus_automatic_continuous:0
+)
+
+# Profiles live in camshare.conf as PROFILE_<name>, so adding one needs no code:
+#
+#   PROFILE_studio="150 300 5200 1 0"
+#
+# Fields: brightness exposure wb_temp auto_exposure auto_wb
+#
+#   brightness  UVC black level, not gain. 128 is neutral; raising it lifts the
+#               shadows and washes the image out rather than brightening faces.
+#   exposure    exposure_time_absolute. Often coarsely quantised, so sweep it
+#               rather than assuming small changes do anything.
+#   wb_temp     white_balance_temperature. Names the *assumed* illuminant, so
+#               higher values push the image warmer -- backwards from intuition.
+#   auto_*      hand control back to the camera. Its metering will favour a
+#               bright background over your face, which is the usual complaint.
+lookup() {
+    local vals
+    vals=$(camshare_profile "$1")
+    [ -n "$vals" ] || return 1
+    echo "$vals"
+}
+
+# Every PROFILE_* defined in the config, for help text and error messages.
+profile_names() {
+    compgen -A variable PROFILE_ | sed 's/^PROFILE_//' | sort | paste -sd' ' -
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: camlight <command>
+
+profiles              defined as PROFILE_<name> in camshare.conf; add your own
+  day                  tuned for daylight -- retune it for your room
+  evening              lamp-lit room: warmer white balance, shadows lifted
+  auto                 hand exposure and white balance back to the camera
+
+manual
+  set CTRL=VAL ...     set individual controls on top of the current profile
+  reset                discard manual tweaks, return to the last named profile
+  controls             list every control the camera exposes, with ranges
+
+  Names may be aliases or the raw v4l2 name:
+    brightness  contrast  saturation  hue  sharpness  zoom
+    exposure -> exposure_time_absolute      ae      -> auto_exposure
+    wb       -> white_balance_temperature   auto_wb -> white_balance_automatic
+    focus    -> focus_absolute              autofocus -> focus_automatic_continuous
+
+  Setting exposure, wb or focus turns the matching auto off for you.
+
+other
+  status               saved profile, manual tweaks, and the live controls
+  restore              reapply what is saved (camshare.sh calls this at startup)
+
+examples
+  camlight set brightness=150
+  camlight set exposure=800 wb=4200
+  camlight evening && camlight set sharpness=90
+
+Everything is applied live; restarting camshare.service is never required.
+EOF
+    exit 2
+}
+
+die() { echo "camlight: $*" >&2; exit 1; }
+
+require_cam() {
+    [ -e "$CAM" ] || die "$CAM not present"
+}
+
+# Map a friendly name onto the real v4l2 control name.
+resolve() {
+    case $1 in
+        exposure|exp)              echo exposure_time_absolute ;;
+        ae|autoexposure)           echo auto_exposure ;;
+        wb|wb_temp|white_balance)  echo white_balance_temperature ;;
+        auto_wb|awb)               echo white_balance_automatic ;;
+        focus)                     echo focus_absolute ;;
+        autofocus|af)              echo focus_automatic_continuous ;;
+        zoom)                      echo zoom_absolute ;;
+        powerline|hz)              echo power_line_frequency ;;
+        *)                         echo "$1" ;;
+    esac
+}
+
+# Reject bad values here rather than letting v4l2-ctl fail control-by-control,
+# which would leave a half-applied set behind.
+validate() {
+    local ctrl=$1 val=$2 line type min max
+    line=$(v4l2-ctl -d "$CAM" --list-ctrls 2>/dev/null | grep -E "^[[:space:]]*$ctrl 0x") \
+        || die "unknown control '$ctrl' (try: camlight controls)"
+
+    [[ $val =~ ^-?[0-9]+$ ]] || die "$ctrl: '$val' is not an integer"
+
+    type=$(sed -n 's/.*(\([a-z]*\)).*/\1/p' <<<"$line")
+    if [ "$type" = bool ]; then
+        [ "$val" = 0 ] || [ "$val" = 1 ] || die "$ctrl is a bool: use 0 or 1"
+        return 0
+    fi
+
+    min=$(sed -n 's/.*min=\(-\?[0-9]*\).*/\1/p' <<<"$line")
+    max=$(sed -n 's/.*max=\(-\?[0-9]*\).*/\1/p' <<<"$line")
+    if [ -n "$min" ] && [ -n "$max" ]; then
+        if [ "$val" -lt "$min" ] || [ "$val" -gt "$max" ]; then
+            die "$ctrl must be between $min and $max (got $val)"
+        fi
+    fi
+    return 0
+}
+
+# Expand a named profile into control=value pairs. Controls gated by an auto that
+# the profile leaves on are omitted, since setting them would be a no-op.
+profile_pairs() {
+    local b e wb ae awb
+    read -r b e wb ae awb < <(lookup "$1")
+    echo "brightness=$b"
+    echo "auto_exposure=$ae"
+    [ "$ae" = 1 ]  && echo "exposure_time_absolute=$e"
+    echo "white_balance_automatic=$awb"
+    [ "$awb" = 0 ] && echo "white_balance_temperature=$wb"
+    return 0
+}
+
+# The base profile. Manual tweaks never overwrite this, so 'reset' always has a
+# named profile to fall back to.
+saved_name() {
+    local p=${DEFAULT_PROFILE:-auto}
+    [ -r "$PROFILE_FILE" ] && read -r p <"$PROFILE_FILE"
+    lookup "$p" >/dev/null 2>&1 || p=${DEFAULT_PROFILE:-auto}
+    printf '%s' "$p"
+}
+
+# What is actually in effect: the custom layer if one exists, else the base
+# profile expanded.
+saved_pairs() {
+    if [ -r "$CUSTOM_FILE" ]; then
+        cat "$CUSTOM_FILE"
+    else
+        profile_pairs "$(saved_name)"
+    fi
+}
+
+# Apply control=value pairs from stdin, in ORDER, skipping anything unset.
+apply_pairs() {
+    local -A want=()
+    local ctrl val rc=0
+    while IFS='=' read -r ctrl val; do
+        [ -n "${ctrl:-}" ] || continue
+        want[$ctrl]=$val
+    done
+
+    # A manual control whose gating auto is left on cannot be written at all --
+    # the driver rejects it with EACCES. Drop it rather than failing the set.
+    local rule manual auto off
+    for rule in "${IMPLIES[@]}"; do
+        IFS=: read -r manual auto off <<<"$rule"
+        if [ -n "${want[$auto]+set}" ] && [ "${want[$auto]}" != "$off" ] \
+           && [ -n "${want[$manual]+set}" ]; then
+            echo "camlight: skipping $manual, $auto=${want[$auto]} overrides it" >&2
+            unset "want[$manual]"
+        fi
+    done
+
+    for ctrl in "${ORDER[@]}"; do
+        [ -n "${want[$ctrl]+set}" ] || continue
+        v4l2-ctl -d "$CAM" --set-ctrl="$ctrl=${want[$ctrl]}" || rc=1
+    done
+    return $rc
+}
+
+cmd_set() {
+    [ $# -gt 0 ] || usage
+    require_cam
+
+    local -A merged=()
+    local ctrl val pair
+
+    # Start from what is already in effect so 'set' is a tweak, not a reset.
+    while IFS='=' read -r ctrl val; do
+        [ -n "${ctrl:-}" ] && merged[$ctrl]=$val
+    done < <(saved_pairs)
+
+    for pair in "$@"; do
+        [[ $pair == *=* ]] || die "expected CTRL=VALUE, got '$pair'"
+        ctrl=$(resolve "${pair%%=*}")
+        val=${pair#*=}
+        validate "$ctrl" "$val"
+        merged[$ctrl]=$val
+
+        # Turn off the auto that would otherwise ignore this value, unless the
+        # same command line sets that auto explicitly.
+        local rule manual auto off other
+        for rule in "${IMPLIES[@]}"; do
+            IFS=: read -r manual auto off <<<"$rule"
+            if [ "$ctrl" = "$manual" ]; then
+                for other in "$@"; do
+                    [ "$(resolve "${other%%=*}")" = "$auto" ] && continue 2
+                done
+                if [ "${merged[$auto]:-}" != "$off" ]; then
+                    merged[$auto]=$off
+                    echo "camlight: $auto -> $off (required for $manual to take effect)"
+                fi
+            fi
+        done
+    done
+
+    # Apply before saving, so a rejected set never leaves bad state behind for
+    # camshare.sh to reapply at every boot.
+    local tmp; tmp=$(mktemp) || die "cannot create a temp file"
+    for ctrl in "${ORDER[@]}"; do
+        [ -n "${merged[$ctrl]+set}" ] && echo "$ctrl=${merged[$ctrl]}" >>"$tmp"
+    done
+
+    if ! apply_pairs <"$tmp"; then
+        rm -f "$tmp"
+        die "the driver rejected one or more controls; nothing was saved"
+    fi
+
+    mkdir -p "$STATE_DIR" || { rm -f "$tmp"; die "cannot write $STATE_DIR"; }
+    mv "$tmp" "$CUSTOM_FILE" && chmod 644 "$CUSTOM_FILE"
+    echo "camlight: applied, saved as tweaks on '$(saved_name)' ($CUSTOM_FILE)"
+}
+
+cmd_profile() {
+    require_cam
+    profile_pairs "$1" | apply_pairs || die "failed to apply '$1'"
+    mkdir -p "$STATE_DIR" && printf '%s\n' "$1" >"$PROFILE_FILE"
+    rm -f "$CUSTOM_FILE"
+    echo "camlight: '$1' profile active and saved"
+}
+
+case ${1:-status} in
+    set)
+        shift
+        cmd_set "$@"
+        ;;
+    reset)
+        [ -r "$CUSTOM_FILE" ] || echo "camlight: no manual tweaks to discard" >&2
+        rm -f "$CUSTOM_FILE"
+        cmd_profile "$(saved_name)"
+        ;;
+    controls)
+        require_cam
+        v4l2-ctl -d "$CAM" --list-ctrls-menus
+        ;;
+    restore)
+        require_cam
+        saved_pairs | apply_pairs || die "failed to restore saved settings"
+        ;;
+    status)
+        if [ -r "$CUSTOM_FILE" ]; then
+            echo "saved profile: $(saved_name) + manual tweaks"
+        else
+            echo "saved profile: $(saved_name)"
+        fi
+        echo "camera:        $CAM -> $(readlink -f "$CAM" 2>/dev/null || echo absent)"
+        if [ -r "$CUSTOM_FILE" ]; then
+            echo
+            echo "manual settings ($CUSTOM_FILE), reset with 'camlight reset':"
+            sed 's/^/  /' "$CUSTOM_FILE"
+        fi
+        echo
+        echo "live controls:"
+        v4l2-ctl -d "$CAM" --get-ctrl=brightness,contrast,saturation,sharpness,auto_exposure,exposure_time_absolute,white_balance_automatic,white_balance_temperature,zoom_absolute 2>&1 | sed 's/^/  /'
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        # Anything matching a PROFILE_<name> in the config is a profile switch,
+        # so users can add their own without touching this script.
+        if lookup "$1" >/dev/null 2>&1; then
+            cmd_profile "$1"
+        else
+            echo "camlight: unknown command or profile '$1'" >&2
+            echo "camlight: profiles defined: $(profile_names)" >&2
+            usage
+        fi
+        ;;
+esac
