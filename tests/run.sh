@@ -300,6 +300,15 @@ else
     # The client half cannot be driven headlessly, so assert the retry wiring is
     # at least present: without it a single early failure is never retried.
     page=$(curl -s --max-time 5 "$URL/")
+    # PAGE is a raw Python string so that JS escapes reach the browser intact.
+    # Without that, Python consumed them: \n became a real newline inside a JS
+    # string literal and the whole script died with a syntax error, leaving the
+    # page frozen on its initial markup.
+    js_newlines=$(printf '%s' "$page" | grep -c 'camshare?\\n\\nThis stops' || true)
+    is "JS escapes survive into the page" "$js_newlines" "1"
+    is "no raw newline inside that JS string" \
+       "$(printf '%s' "$page" | grep -c "confirm('Stop camshare?$" || true)" "0"
+
     for marker in 'reloadPreview' 'img.onerror' 'previewTries'; do
         case $page in *"$marker"*) ok "page wires up $marker" ;;
                       *) bad "page wires up $marker" ;; esac

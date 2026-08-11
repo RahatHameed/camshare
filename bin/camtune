@@ -389,7 +389,7 @@ class Handler(BaseHTTPRequestHandler):
             release_preview(proc)
 
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>camtune</title>
@@ -587,8 +587,8 @@ function renderService(state, previewState) {
   document.getElementById('pvbtn').textContent = paused ? 'resume preview' : 'pause preview';
   document.getElementById('shademsg').innerHTML = running
     ? 'Preview paused. Only this preview is stopped &mdash; your apps keep working.'
-    : 'camshare is stopped &mdash; every virtual camera is down and the camera\'s '
-      + 'indicator light is off.<br>Apps launched while it is stopped will not '
+    : 'camshare is stopped &mdash; every virtual camera is down and the '
+      + 'indicator light on the camera is off.<br>Apps launched while it is stopped will not '
       + 'list the virtual cameras.';
   document.getElementById('shade').className = 'shade' + (live ? '' : ' stopped');
 

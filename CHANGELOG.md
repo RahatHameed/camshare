@@ -8,6 +8,11 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The browser page died with a JavaScript syntax error and froze on its initial
+  markup. Its HTML lives in a Python string, which was consuming the escapes
+  meant for JavaScript -- `\n` became a real newline inside a string literal.
+  The template is a raw string now, and a test pins it.
+
 - The browser UI's stop button stopped the whole fan-out, taking every
   application's camera down. Pausing the preview is now the primary control and
   affects only this page; stopping the fan-out is a separate, confirmed action.
