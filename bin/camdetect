@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Find the USB camera to share and write a camshare config for it.
+#
+# Picking the right node by hand is the fiddliest part of setting this up: a
+# single camera usually claims two /dev/video* nodes, only one of which can
+# capture, and the numbers move between boots. This does that lookup for you.
+set -uo pipefail
+
+HERE=$(dirname "$(readlink -f "$0")")
+# shellcheck source=/dev/null
+. "$HERE/camshare-conf"
+
+OUT=${CAMSHARE_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/camshare/camshare.conf}
+TEMPLATE=$HERE/../camshare.conf.example
+WANT=""
+FORCE=0
+LINK=""
+
+usage() {
+    cat >&2 <<'EOF'
+usage: camdetect [--device /dev/videoN] [--link NAME] [--output FILE] [--force]
+                 [--list]
+
+Detects a USB camera and writes its ids into a camshare config.
+
+  --device   use this capture node instead of auto-picking
+  --link     name for the stable symlink (default: keep existing, else camshare0)
+  --output   config file to write (default: ~/.config/camshare/camshare.conf)
+  --force    overwrite camera ids already present in the config
+  --list     just print what was found, write nothing
+EOF
+    exit 2
+}
+
+LIST=0
+while [ $# -gt 0 ]; do
+    case $1 in
+        --device) WANT=${2:-}; shift 2 ;;
+        --link)   LINK=${2:-}; shift 2 ;;
+        --output) OUT=${2:-}; shift 2 ;;
+        --force)  FORCE=1; shift ;;
+        --list)   LIST=1; shift ;;
+        -h|--help) usage ;;
+        *) echo "camdetect: unknown option '$1'" >&2; usage ;;
+    esac
+done
+
+# Walk up the sysfs tree from a video node to the USB device that owns it, and
+# read one of its attributes. Non-USB devices (laptop MIPI/IPU6 pipelines) have
+# no such parent, which is exactly how we filter them out.
+usb_attr() {
+    local dir=$1 attr=$2
+    dir=$(readlink -f "$dir/device" 2>/dev/null) || return 1
+    while [ -n "$dir" ] && [ "$dir" != / ]; do
+        if [ -r "$dir/idVendor" ]; then
+            [ -r "$dir/$attr" ] && cat "$dir/$attr" 2>/dev/null
+            return 0
+        fi
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+
+# A node is usable only if it advertises Video Capture. The second node a camera
+# exposes is usually metadata-only: it looks real, lists zero pixel formats, and
+# silently fails for every app that tries it.
+can_capture() {
+    v4l2-ctl -d "$1" --info 2>/dev/null \
+        | grep -A4 'Device Caps' | grep -q 'Video Capture'
+}
+
+candidates=()
+while IFS= read -r sysdev; do
+    node=/dev/${sysdev##*/}
+    [ -e "$node" ] || continue
+    vendor=$(usb_attr "$sysdev" idVendor) || continue
+    [ -n "$vendor" ] || continue
+    index=$(cat "$sysdev/index" 2>/dev/null) || continue
+    [ "$index" = 0 ] || continue
+    can_capture "$node" || continue
+    product=$(usb_attr "$sysdev" idProduct)
+    serial=$(usb_attr "$sysdev" serial)
+    name=$(cat "$sysdev/name" 2>/dev/null)
+    candidates+=("$node|$vendor|$product|$serial|$name")
+done < <(find /sys/class/video4linux -maxdepth 1 -name 'video*' | sort -V)
+
+if [ ${#candidates[@]} -eq 0 ]; then
+    echo "camdetect: no USB capture camera found." >&2
+    echo "  Plugged in? Try: lsusb | grep -i cam" >&2
+    echo "  Built-in laptop cameras on Intel IPU6 are not USB and cannot be used." >&2
+    exit 1
+fi
+
+echo "Found ${#candidates[@]} USB capture camera(s):"
+i=0
+for c in "${candidates[@]}"; do
+    IFS='|' read -r node vendor product serial name <<<"$c"
+    i=$((i + 1))
+    printf '  %d) %-14s %s\n' "$i" "$node" "$name"
+    printf '     %s:%s%s\n' "$vendor" "$product" \
+        "${serial:+  serial $serial}"
+done
+echo
+
+[ "$LIST" = 1 ] && exit 0
+
+chosen=""
+if [ -n "$WANT" ]; then
+    for c in "${candidates[@]}"; do
+        [ "${c%%|*}" = "$WANT" ] && chosen=$c && break
+    done
+    [ -n "$chosen" ] || { echo "camdetect: $WANT is not one of the above" >&2; exit 1; }
+elif [ ${#candidates[@]} -eq 1 ]; then
+    chosen=${candidates[0]}
+else
+    echo "camdetect: more than one camera; pick one with --device, e.g." >&2
+    echo "  camdetect --device ${candidates[0]%%|*}" >&2
+    exit 1
+fi
+
+IFS='|' read -r node vendor product serial name <<<"$chosen"
+
+# Keep whatever link name is already configured, so re-running detect on an
+# existing setup does not silently rename the device out from under systemd.
+if [ -z "$LINK" ]; then
+    camshare_conf_load >/dev/null 2>&1
+    LINK=${CAM_LINK:-camshare0}
+fi
+
+if [ ! -e "$OUT" ]; then
+    mkdir -p "$(dirname "$OUT")" || { echo "camdetect: cannot create $(dirname "$OUT")" >&2; exit 1; }
+    cp "$TEMPLATE" "$OUT" || { echo "camdetect: cannot seed $OUT from $TEMPLATE" >&2; exit 1; }
+    echo "seeded $OUT from camshare.conf.example"
+elif [ "$FORCE" != 1 ] && grep -qE '^CAM_VENDOR="[0-9a-fA-F]+"' "$OUT"; then
+    echo "camdetect: $OUT already names a camera; re-run with --force to replace it." >&2
+    exit 1
+fi
+
+set_key() {
+    local key=$1 val=$2
+    if grep -qE "^${key}=" "$OUT"; then
+        sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$OUT"
+    else
+        printf '%s="%s"\n' "$key" "$val" >>"$OUT"
+    fi
+}
+
+set_key CAM_VENDOR  "$vendor"
+set_key CAM_PRODUCT "$product"
+set_key CAM_SERIAL  "$serial"
+set_key CAM_LINK    "$LINK"
+
+echo "Selected: $name  ($node)"
+echo "  CAM_VENDOR=$vendor  CAM_PRODUCT=$product${serial:+  CAM_SERIAL=$serial}"
+echo "  CAM_LINK=$LINK   -> /dev/$LINK"
+echo
+echo "wrote $OUT"
+echo
+echo "Next:"
+echo "  review $OUT      (loopback count, labels, resolution)"
+echo "  make install-system     # udev rule + module options, needs sudo"
+echo "  make install            # scripts and the user service"
