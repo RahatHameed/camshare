@@ -1,0 +1,16 @@
+[Unit]
+Description=Share one USB camera with several apps via v4l2loopback
+Documentation=man:v4l2loopback(4)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/camshare.sh
+# The camera is a USB device: it can vanish on unplug or be briefly held by
+# another app. Keep retrying rather than failing permanently.
+Restart=always
+RestartSec=5
+StartLimitBurst=0
+
+[Install]
+WantedBy=default.target
