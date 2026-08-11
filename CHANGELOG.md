@@ -6,6 +6,10 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- CI and license badges in the README.
+
 ## [0.1.0] - 2026-08-11
 
 First public version. Generalised from a single-machine setup into something

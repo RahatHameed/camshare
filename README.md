@@ -1,5 +1,8 @@
 # camshare
 
+[![ci](https://github.com/RahatHameed/camshare/actions/workflows/ci.yml/badge.svg)](https://github.com/RahatHameed/camshare/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Use one webcam in several apps at the same time, on Linux.**
 
 Slack and Teams cannot both open your webcam. Whoever starts first wins; everyone
