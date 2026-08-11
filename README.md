@@ -275,6 +275,32 @@ camtune: port 8787 was busy, using 8788
 camtune: http://127.0.0.1:8788
 ```
 
+### Keeping it running across reboots
+
+`make tune` runs in the foreground and dies with your terminal. To have the UI
+always there instead:
+
+```bash
+make tune-enable     # systemd user service, starts at login
+make tune-disable    # stop it and leave it stopped
+```
+
+This is cheap. `camtune` spawns gstreamer **only while a browser tab is
+connected** and tears it down when the tab closes, so at rest it is an idle
+Python HTTP server — around 20 MB of RSS and no child processes. It is not
+holding a camera open when you are not looking at it.
+
+Two things to weigh before leaving it enabled:
+
+- **It is another reader of a virtual camera whenever a tab is open.** On
+  marginal setups (high frame rates, deep USB hub chains) that extra reader is
+  what tips gstreamer into `Failed to allocate a buffer`. Close the tab during
+  calls if you have seen that.
+- **It listens on localhost the whole time.** Only local processes can reach it,
+  and mutating endpoints are protected from drive-by web pages by the CORS
+  preflight on their JSON content type. Still, an always-on service is a wider
+  surface than an on-demand one. On a shared machine, prefer `make tune`.
+
 Set `TUNE_PORT` in `camshare.conf` to change the default, or override per run:
 
 ```bash

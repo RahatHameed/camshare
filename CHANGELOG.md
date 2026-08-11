@@ -9,6 +9,9 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 
 - CI and license badges in the README.
+- `camtune.service` with `make tune-enable` / `make tune-disable`, so the browser
+  UI can survive reboots. Installed but not enabled by default; gstreamer is
+  only spawned while a browser tab is connected, so it is idle at rest.
 
 ## [0.1.0] - 2026-08-11
 

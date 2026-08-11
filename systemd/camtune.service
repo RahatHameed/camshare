@@ -1,0 +1,18 @@
+[Unit]
+Description=camtune browser UI for camera tuning
+Documentation=https://github.com/RahatHameed/camshare
+# Only useful once the fan-out is running, since it previews a virtual camera.
+After=camshare.service
+Wants=camshare.service
+
+[Service]
+Type=simple
+# No arguments: port and devices come from camshare.conf.
+ExecStart=%h/.local/bin/camtune
+# Idle when no browser is connected -- gstreamer is spawned per preview request
+# and torn down when the tab closes, so this costs almost nothing at rest.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

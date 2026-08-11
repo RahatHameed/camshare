@@ -17,6 +17,7 @@ UNIT_DIR  ?= $(HOME)/.config/systemd/user
 CONF_DIR  ?= $(HOME)/.config/camshare
 CONF      ?= $(CONF_DIR)/camshare.conf
 SERVICE   := camshare.service
+TUNE_UNIT := camtune.service
 SNAP_DIR  ?= /tmp/camshare-snaps
 
 SCRIPTS   := camshare.sh camlight camtune camdetect camgen camshare-conf
@@ -94,6 +95,7 @@ install: ## Install scripts + user service, then start it
 	  echo "seeded $(CONF) -- run 'make detect' to fill in your camera"; }
 	@for s in $(SCRIPTS); do install -Dm755 bin/$$s $(PREFIX)/$$s; done
 	@install -Dm644 systemd/$(SERVICE) $(UNIT_DIR)/$(SERVICE)
+	@install -Dm644 systemd/$(TUNE_UNIT) $(UNIT_DIR)/$(TUNE_UNIT)
 	@$(SYSTEMCTL) daemon-reload
 	@$(SYSTEMCTL) enable --now $(SERVICE)
 	@echo "installed -> $(PREFIX)/{$(shell echo $(SCRIPTS) | tr ' ' ',')}"
@@ -116,7 +118,8 @@ install-system: ## Generate + install udev rule and module options (sudo, once)
 uninstall: ## Stop the service and remove the user-scope files
 	-@$(SYSTEMCTL) disable --now $(SERVICE)
 	-@for s in $(SCRIPTS); do rm -f $(PREFIX)/$$s; done
-	-@rm -f $(UNIT_DIR)/$(SERVICE)
+	-@$(SYSTEMCTL) disable --now $(TUNE_UNIT) 2>/dev/null
+	-@rm -f $(UNIT_DIR)/$(SERVICE) $(UNIT_DIR)/$(TUNE_UNIT)
 	@$(SYSTEMCTL) daemon-reload
 	@echo "removed. config kept at $(CONF); system files see uninstall-system"
 
@@ -159,7 +162,7 @@ logs: ## Follow the service log
 
 # --------------------------------------------------------------- lighting ---
 
-.PHONY: day evening auto light set reset controls tune
+.PHONY: day evening auto light set reset controls tune tune-enable tune-disable
 day: ## Lighting profile: daylight (retune for your room)
 	@$(CAMLIGHT) day
 
@@ -181,6 +184,14 @@ controls: ## List every camera control with its range and current value
 
 light: ## Show the active lighting profile and controls
 	@$(CAMLIGHT) status
+
+tune-enable: ## Run the browser UI as a service, surviving reboots
+	@$(SYSTEMCTL) enable --now $(TUNE_UNIT)
+	@$(SYSTEMCTL) --no-pager -o cat status $(TUNE_UNIT) | head -4
+
+tune-disable: ## Stop the browser UI service and leave it stopped
+	@$(SYSTEMCTL) disable --now $(TUNE_UNIT)
+	@echo "stopped; 'make tune' still runs it in the foreground"
 
 tune: ## Live preview + sliders in a browser (Ctrl-C to stop)
 	@$(CAMTUNE) --port $(TUNE_PORT) --loopback $(FIRST_DEV) \
@@ -239,14 +250,17 @@ diff: ## Show how the installed copies differ from this repo
 	@for s in $(SCRIPTS); do \
 	  diff -u bin/$$s $(PREFIX)/$$s >/dev/null 2>&1 || { echo "--- $$s ---"; diff -u bin/$$s $(PREFIX)/$$s || true; }; \
 	done
-	@diff -u systemd/$(SERVICE) $(UNIT_DIR)/$(SERVICE) >/dev/null 2>&1 || \
-	  { echo "--- $(SERVICE) ---"; diff -u systemd/$(SERVICE) $(UNIT_DIR)/$(SERVICE) || true; }
+	@for u in $(SERVICE) $(TUNE_UNIT); do \
+	  diff -u systemd/$$u $(UNIT_DIR)/$$u >/dev/null 2>&1 || \
+	    { echo "--- $$u ---"; diff -u systemd/$$u $(UNIT_DIR)/$$u || true; }; \
+	done
 	@echo "(no output above means the repo matches what is installed)"
 
 .PHONY: sync
 sync: ## Copy the live installed files back into this repo
 	@for s in $(SCRIPTS); do cp $(PREFIX)/$$s bin/$$s; done
 	@cp $(UNIT_DIR)/$(SERVICE) systemd/$(SERVICE)
+	@cp $(UNIT_DIR)/$(TUNE_UNIT) systemd/$(TUNE_UNIT)
 	@echo "repo updated from $(PREFIX) and $(UNIT_DIR)"
 
 .PHONY: test
