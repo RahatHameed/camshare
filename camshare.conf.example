@@ -1,0 +1,82 @@
+# camshare configuration.
+#
+# Copy this to ~/.config/camshare/camshare.conf and edit, or let `make detect`
+# write it for you. It is sourced by bash and also parsed by camtune, so keep to
+# plain KEY="value" lines: no arrays, no command substitution, no conditionals.
+
+# ------------------------------------------------------------------ camera ---
+
+# USB ids of the camera to share. `make detect` fills these in. To find them by
+# hand, look for your camera in `lsusb`:
+#   Bus 003 Device 015: ID 046d:086b Logitech, Inc. BRIO
+#                          ^^^^ ^^^^
+#                        vendor product
+CAM_VENDOR=""
+CAM_PRODUCT=""
+
+# Serial number. Only needed to tell two *identical* cameras apart; leave empty
+# if your camera reports none or you own only one. Many cheap cameras report the
+# same serial for every unit, which makes it useless for that purpose anyway.
+CAM_SERIAL=""
+
+# Name of the stable symlink created for the camera, as /dev/$CAM_LINK.
+# Always use this rather than /dev/videoN: the number is assigned in USB
+# enumeration order and changes between boots and dock replugs.
+CAM_LINK="camshare0"
+
+# --------------------------------------------------------- virtual cameras ---
+
+# One "number:label" entry per virtual camera, separated by semicolons.
+#
+#   number  becomes /dev/video<number>. Use something high (70+) so it cannot
+#           collide with real hardware, which numbers upward from 0.
+#   label   what apps show in their camera list. Give each app its own label so
+#           you can tell which is which in a dropdown.
+#
+# Two is the usual case, one per app. Add entries for more apps. There is no
+# hard limit, but each device is another full-frame copy per frame -- see
+# "How many virtual cameras?" in the README before going wide.
+LOOPBACKS="70:CamShare A;71:CamShare B"
+
+# ------------------------------------------------------------------ format ---
+
+# Only sizes your camera lists under MJPG are valid -- check with `make formats`.
+# 60fps usually exists only at 1080p and below. 30 is a deliberate default: it is
+# what call apps use anyway, and it halves both USB and memory load. Raise it
+# only if you have a reason and the bandwidth (see the USB notes in the README).
+WIDTH=1920
+HEIGHT=1080
+FPS=30
+
+# -------------------------------------------------------------- browser UI ---
+
+# Port for `camtune`. Anything above 1024 works; below 1024 would need root,
+# which camtune has no reason to have. If the port is busy -- another camtune,
+# or anything else -- it walks forward to the next free one and tells you.
+TUNE_PORT=8787
+
+# -------------------------------------------------------- lighting profiles ---
+
+# Fields, in order: brightness exposure wb_temp auto_exposure auto_wb
+#
+# IMPORTANT: the day/evening values below are placeholders. They CANNOT be right
+# for your room -- correct exposure and white balance depend entirely on your
+# lighting. Run `make tune`, drag the sliders until the preview looks right, hit
+# Save, then copy what `camlight status` reports back into here so it is version
+# controlled.
+#
+# Units and gotchas (measured on a UGREEN FineCam; yours will differ):
+#   exposure  exposure_time_absolute, often in 100us units. Frequently quantised
+#             into very few real steps, so a change of 50 may do nothing at all
+#             while a change of 200 is dramatic. Sweep it, do not assume linear.
+#   wb_temp   white_balance_temperature names the *assumed* illuminant, so
+#             HIGHER values make the image WARMER. This is backwards from
+#             intuition and is a common source of blue-cast confusion.
+PROFILE_day="128 250 5000 1 0"
+PROFILE_evening="140 500 3800 1 0"
+PROFILE_auto="128 39 4500 3 1"
+
+# Profile applied when nothing has been chosen yet, and by `camlight reset`.
+# "auto" is the safe default: it hands exposure and white balance to the camera,
+# which looks acceptable everywhere. Switch to "day" once you have tuned it.
+DEFAULT_PROFILE="auto"

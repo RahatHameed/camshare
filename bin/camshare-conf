@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Locate, load and query the camshare config.
+#
+# Sourced by the other scripts; also runnable, so `camshare-conf get FPS` works
+# from a Makefile or from camtune without either needing to know the format.
+#
+# Search order, first hit wins:
+#   $CAMSHARE_CONF
+#   ${XDG_CONFIG_HOME:-~/.config}/camshare/camshare.conf
+#   /etc/camshare.conf
+#   camshare.conf.example next to the repo checkout  (so a bare clone still runs)
+
+# Remember which settings arrived from the environment, before defaults below
+# make every one of them "set". Loading the config would otherwise clobber an
+# explicit `CAM_VENDOR=046d camgen udev`, which is surprising and makes the
+# scripts awkward to test.
+declare -A _CAMSHARE_ENV=()
+for _k in CAM_VENDOR CAM_PRODUCT CAM_SERIAL CAM_LINK LOOPBACKS \
+          WIDTH HEIGHT FPS TUNE_PORT DEFAULT_PROFILE; do
+    [ -n "${!_k+set}" ] && _CAMSHARE_ENV[$_k]=${!_k}
+done
+unset _k
+
+# Defaults, so a missing or partial config still yields a working setup.
+CAM_VENDOR=${CAM_VENDOR:-}
+CAM_PRODUCT=${CAM_PRODUCT:-}
+CAM_SERIAL=${CAM_SERIAL:-}
+CAM_LINK=${CAM_LINK:-camshare0}
+LOOPBACKS=${LOOPBACKS:-70:CamShare A;71:CamShare B}
+WIDTH=${WIDTH:-1920}
+HEIGHT=${HEIGHT:-1080}
+FPS=${FPS:-30}
+TUNE_PORT=${TUNE_PORT:-8787}
+DEFAULT_PROFILE=${DEFAULT_PROFILE:-auto}
+PROFILE_day=${PROFILE_day:-128 250 5000 1 0}
+PROFILE_evening=${PROFILE_evening:-140 500 3800 1 0}
+PROFILE_auto=${PROFILE_auto:-128 39 4500 3 1}
+
+camshare_conf_path() {
+    local here candidates=()
+    here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+    [ -n "${CAMSHARE_CONF:-}" ] && candidates+=("$CAMSHARE_CONF")
+    candidates+=("${XDG_CONFIG_HOME:-$HOME/.config}/camshare/camshare.conf")
+    candidates+=("/etc/camshare.conf")
+    candidates+=("$here/../camshare.conf.example")
+    local c
+    for c in "${candidates[@]}"; do
+        [ -r "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+camshare_conf_load() {
+    local path
+    path=$(camshare_conf_path) || return 1
+    # Only KEY=VALUE lines are honoured. Sourcing arbitrary shell out of a config
+    # would make a typo in it able to do anything, so filter first.
+    local tmp
+    tmp=$(mktemp) || return 1
+    grep -E '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$path" >"$tmp"
+    # shellcheck disable=SC1090
+    . "$tmp"
+    rm -f "$tmp"
+
+    # Environment wins over the file.
+    local k
+    for k in "${!_CAMSHARE_ENV[@]}"; do
+        printf -v "$k" '%s' "${_CAMSHARE_ENV[$k]}"
+    done
+
+    CAMSHARE_CONF_LOADED=$path
+    return 0
+}
+
+# /dev path of the real camera.
+camshare_cam() { printf '/dev/%s' "$CAM_LINK"; }
+
+# Emit "number label" per virtual camera, one per line.
+camshare_loopbacks() {
+    local entries=() entry
+    IFS=';' read -ra entries <<<"$LOOPBACKS"
+    for entry in "${entries[@]}"; do
+        [ -n "$entry" ] || continue
+        printf '%s %s\n' "${entry%%:*}" "${entry#*:}"
+    done
+}
+
+camshare_devices()    { camshare_loopbacks | awk '{print "/dev/video" $1}'; }
+camshare_numbers()    { camshare_loopbacks | awk '{print $1}' | paste -sd, -; }
+camshare_labels()     { camshare_loopbacks | cut -d' ' -f2- | paste -sd, -; }
+camshare_count()      { camshare_loopbacks | grep -c . ; }
+camshare_profile()    { eval "printf '%s' \"\${PROFILE_$1:-}\""; }
+camshare_profiles()   { compgen -A variable PROFILE_ | sed 's/^PROFILE_//' | sort; }
+
+# Only act as a CLI when executed directly, not when sourced.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    set -uo pipefail
+    camshare_conf_load
+    case ${1:-path} in
+        path)      camshare_conf_path ;;
+        cam)       camshare_cam; echo ;;
+        devices)   camshare_devices ;;
+        numbers)   camshare_numbers ;;
+        labels)    camshare_labels ;;
+        count)     camshare_count ;;
+        loopbacks) camshare_loopbacks ;;
+        profile)   camshare_profile "${2:-}"; echo ;;
+        profiles)  camshare_profiles ;;
+        get)       eval "printf '%s\n' \"\${${2:-}:-}\"" ;;
+        dump)
+            echo "config:    ${CAMSHARE_CONF_LOADED:-none}"
+            echo "camera:    $(camshare_cam)  ($CAM_VENDOR:$CAM_PRODUCT serial='${CAM_SERIAL}')"
+            echo "format:    ${WIDTH}x${HEIGHT}@${FPS}"
+            echo "default:   $DEFAULT_PROFILE"
+            echo "loopbacks: $(camshare_count)"
+            camshare_loopbacks | while read -r n l; do echo "  /dev/video$n  $l"; done
+            ;;
+        *) echo "usage: camshare-conf {path|cam|devices|numbers|labels|count|loopbacks|profile NAME|get KEY|dump}" >&2
+           exit 2 ;;
+    esac
+fi
