@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""Live preview and sliders for tuning a UVC camera, in a browser.
+
+Serves a page on 127.0.0.1 with an MJPEG preview and one slider per camera
+control. Moving a slider applies the change immediately with v4l2-ctl; the Save
+button hands the result to camlight so it persists across restarts.
+
+The preview reads a *virtual* camera, not the real one. That matters twice over:
+it does not contend with camshare for the device, and what you see is exactly
+what your video apps receive. Tools that preview the real camera get this wrong
+in both directions.
+
+Standard library only, no packaging, no dependencies. Ctrl-C to stop.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BOUNDARY = "camtune"
+
+# Controls camlight knows how to persist, in the order it applies them. Anything
+# outside this list is still adjustable live, it just will not be saved.
+SAVEABLE = [
+    "brightness", "contrast", "saturation", "hue", "sharpness",
+    "power_line_frequency", "auto_exposure", "exposure_time_absolute",
+    "white_balance_automatic", "white_balance_temperature",
+    "focus_automatic_continuous", "focus_absolute", "zoom_absolute",
+]
+
+# Friendlier labels; anything unlisted falls back to the raw name.
+LABELS = {
+    "exposure_time_absolute": "exposure",
+    "white_balance_temperature": "white balance (K)",
+    "white_balance_automatic": "auto white balance",
+    "auto_exposure": "auto exposure",
+    "focus_absolute": "focus",
+    "focus_automatic_continuous": "autofocus",
+    "zoom_absolute": "zoom",
+    "power_line_frequency": "power line",
+}
+
+CTRL_RE = re.compile(r"^\s+(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)$")
+MENU_RE = re.compile(r"^\s+(\d+):\s*(.+)$")
+
+
+def run(cmd: list[str]) -> tuple[int, str]:
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
+def sibling(name: str) -> str:
+    """Path to another camshare script next to this one."""
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
+
+
+def conf(*query: str) -> str:
+    """Ask camshare-conf for a config value, so the format lives in one place."""
+    helper = sibling("camshare-conf")
+    if not os.path.exists(helper):
+        return ""
+    rc, out = run([helper, *query])
+    return out if rc == 0 else ""
+
+
+def read_controls(cam: str) -> list[dict]:
+    """Parse `v4l2-ctl --list-ctrls-menus` into something JSON-shaped."""
+    rc, out = run(["v4l2-ctl", "-d", cam, "--list-ctrls-menus"])
+    if rc != 0:
+        return []
+
+    controls: list[dict] = []
+    for line in out.splitlines():
+        m = CTRL_RE.match(line)
+        if m:
+            name, ctype, rest = m.group(1), m.group(2), m.group(3)
+            fields = dict(re.findall(r"(\w+)=(-?\d+)", rest))
+            controls.append({
+                "name": name,
+                "label": LABELS.get(name, name.replace("_", " ")),
+                "type": ctype,
+                "min": int(fields.get("min", 0)),
+                "max": int(fields.get("max", 1)),
+                "step": int(fields.get("step", 1)),
+                "default": int(fields.get("default", 0)),
+                "value": int(fields.get("value", 0)),
+                # An inactive control is gated by an auto_* that is currently on.
+                # Writing it returns EACCES, so the UI greys it out instead.
+                "inactive": "inactive" in rest,
+                "saveable": name in SAVEABLE,
+                "menu": {},
+            })
+            continue
+        m = MENU_RE.match(line)
+        if m and controls and controls[-1]["type"] == "menu":
+            controls[-1]["menu"][m.group(1)] = m.group(2).strip()
+    return controls
+
+
+class Handler(BaseHTTPRequestHandler):
+    cam = "/dev/camshare0"
+    loop = "/dev/video70"
+    camlight = "camlight"
+    profiles: list[str] = []
+    preview = (640, 360, 15)
+
+    def log_message(self, fmt, *args):  # quieter than the default one-line-per-hit
+        pass
+
+    # -- helpers ----------------------------------------------------------
+
+    def _json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> dict:
+        n = int(self.headers.get("Content-Length", 0))
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            return {}
+
+    # -- routes -----------------------------------------------------------
+
+    def do_GET(self):
+        if self.path == "/":
+            body = PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/controls":
+            self._json({"controls": read_controls(self.cam), "device": self.cam,
+                        "profiles": self.profiles})
+        elif self.path == "/stream.mjpg":
+            self.stream()
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/set":
+            data = self._body()
+            name, value = data.get("name"), data.get("value")
+            if not name or value is None:
+                return self._json({"error": "name and value required"}, 400)
+
+            # v4l2-ctl silently clamps out-of-range values and still exits 0, so
+            # an unchecked write looks like it succeeded while storing something
+            # else -- which Save would then persist. Range-check here instead.
+            current = {c["name"]: c for c in read_controls(self.cam)}
+            ctrl = current.get(name)
+            if ctrl is None:
+                return self._json({"error": f"unknown control {name!r}"}, 400)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return self._json({"error": f"{name}: not an integer"}, 400)
+            lo, hi = (0, 1) if ctrl["type"] == "bool" else (ctrl["min"], ctrl["max"])
+            if not lo <= value <= hi:
+                return self._json(
+                    {"error": f"{name} must be between {lo} and {hi}"}, 400)
+            if ctrl["inactive"]:
+                return self._json(
+                    {"error": f"{name} is inactive; turn its auto off first"}, 400)
+
+            rc, out = run(["v4l2-ctl", "-d", self.cam,
+                           f"--set-ctrl={name}={value}"])
+            # Re-read: setting an auto_* flips other controls in or out of
+            # inactive, so the whole panel needs refreshing, not just this one.
+            return self._json({"ok": rc == 0, "error": out if rc else "",
+                               "controls": read_controls(self.cam)})
+
+        if self.path == "/api/profile":
+            action = self._body().get("action", "")
+            # Profiles come from the config, so the UI is not limited to a fixed
+            # set and a user-defined PROFILE_studio works without code changes.
+            if action != "reset" and action not in self.profiles:
+                return self._json({"error": f"bad action {action!r}"}, 400)
+            rc, out = run([self.camlight, action])
+            return self._json({"ok": rc == 0, "message": out,
+                               "controls": read_controls(self.cam)})
+
+        if self.path == "/api/save":
+            pairs = [f"{c['name']}={c['value']}"
+                     for c in read_controls(self.cam)
+                     if c["saveable"] and not c["inactive"]]
+            if not pairs:
+                return self._json({"error": "nothing to save"}, 400)
+            rc, out = run([self.camlight, "set", *pairs])
+            return self._json({"ok": rc == 0, "message": out,
+                               "controls": read_controls(self.cam)})
+
+        self.send_error(404)
+
+    def stream(self):
+        w, h, fps = self.preview
+        cmd = [
+            "gst-launch-1.0", "-q",
+            "v4l2src", f"device={self.loop}",
+            "!", "videoconvert",
+            "!", "videorate",
+            "!", "videoscale",
+            "!", f"video/x-raw,width={w},height={h},framerate={fps}/1",
+            "!", "jpegenc", "quality=70",
+            "!", "multipartmux", f"boundary={BOUNDARY}",
+            "!", "fdsink", "fd=1",
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            return self.send_error(500, f"gstreamer failed: {exc}")
+
+        self.send_response(200)
+        self.send_header("Age", "0")
+        self.send_header("Cache-Control", "no-cache, private")
+        self.send_header(
+            "Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
+        self.end_headers()
+        try:
+            while True:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # browser navigated away; expected
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>camtune</title>
+<style>
+  :root { color-scheme: dark; --bg:#15171b; --panel:#1e2127; --line:#2c3038;
+          --fg:#e6e8ec; --dim:#9aa1ac; --accent:#5aa9e6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif; }
+  .wrap { display:flex; flex-wrap:wrap; gap:20px; padding:20px;
+          max-width:1200px; margin:0 auto; align-items:flex-start; }
+  .left { flex:1 1 480px; min-width:320px; position:sticky; top:20px; }
+  .right { flex:1 1 380px; min-width:300px; }
+  img { width:100%; border-radius:8px; background:#000; display:block; }
+  h1 { font-size:15px; margin:0 0 12px; font-weight:600; letter-spacing:.02em; }
+  h1 span { color:var(--dim); font-weight:400; }
+  .panel { background:var(--panel); border:1px solid var(--line);
+           border-radius:8px; padding:14px; margin-bottom:14px; }
+  .row { margin:0 0 14px; }
+  .row:last-child { margin-bottom:0; }
+  .lbl { display:flex; justify-content:space-between; align-items:baseline;
+         margin-bottom:5px; }
+  .lbl b { font-weight:500; }
+  .lbl i { font-style:normal; color:var(--dim); font-variant-numeric:tabular-nums; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .off { opacity:.38; }
+  .off input { pointer-events:none; }
+  .note { color:var(--dim); font-size:12px; margin-top:3px; }
+  button { background:#2a2f37; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:7px 13px; cursor:pointer; font-size:13px;
+           margin:0 6px 6px 0; }
+  button:hover { background:#333944; border-color:#414855; }
+  button.pri { background:var(--accent); border-color:var(--accent); color:#0b1016;
+               font-weight:600; }
+  select { background:#2a2f37; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:5px; width:100%; }
+  #msg { min-height:19px; font-size:12px; color:var(--dim); margin-top:8px;
+         white-space:pre-wrap; }
+  .err { color:#f0857d !important; }
+</style></head><body>
+<div class="wrap">
+  <div class="left">
+    <h1>camtune <span id="dev"></span></h1>
+    <img id="preview" src="/stream.mjpg" alt="live preview">
+    <div class="note">Preview reads a virtual camera &mdash; the same frames your
+      apps get. Adjustments apply instantly; nothing persists until you press
+      Save.</div>
+  </div>
+  <div class="right">
+    <div class="panel">
+      <button class="pri" onclick="save()">Save to camlight</button>
+      <span id="profiles"></span>
+      <div id="msg"></div>
+    </div>
+    <div class="panel" id="controls">loading&hellip;</div>
+  </div>
+</div>
+<script>
+let timer = null;
+
+function say(text, isErr) {
+  const m = document.getElementById('msg');
+  m.textContent = text || '';
+  m.className = isErr ? 'err' : '';
+}
+
+function render(controls) {
+  const box = document.getElementById('controls');
+  box.innerHTML = '';
+  for (const c of controls) {
+    const row = document.createElement('div');
+    row.className = 'row' + (c.inactive ? ' off' : '');
+
+    const lbl = document.createElement('div');
+    lbl.className = 'lbl';
+    const b = document.createElement('b');
+    b.textContent = c.label;
+    const i = document.createElement('i');
+    i.textContent = c.type === 'menu' && c.menu[c.value]
+      ? c.menu[c.value] : c.value;
+    lbl.append(b, i);
+    row.append(lbl);
+
+    if (c.type === 'menu' && Object.keys(c.menu).length) {
+      const sel = document.createElement('select');
+      for (const [v, text] of Object.entries(c.menu)) {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = text;
+        if (+v === c.value) o.selected = true;
+        sel.append(o);
+      }
+      sel.onchange = () => set(c.name, +sel.value);
+      row.append(sel);
+    } else {
+      const r = document.createElement('input');
+      r.type = 'range';
+      r.min = c.type === 'bool' ? 0 : c.min;
+      r.max = c.type === 'bool' ? 1 : c.max;
+      r.step = c.step || 1;
+      r.value = c.value;
+      r.oninput = () => { i.textContent = r.value; };
+      // Debounced: dragging a slider would otherwise fire a v4l2-ctl per pixel.
+      r.onchange = () => set(c.name, +r.value);
+      row.append(r);
+    }
+
+    if (c.inactive) {
+      const n = document.createElement('div');
+      n.className = 'note';
+      n.textContent = 'inactive \\u2014 turn its auto off to use this';
+      row.append(n);
+    }
+    box.append(row);
+  }
+}
+
+async function post(url, payload) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload || {}),
+  });
+  return res.json();
+}
+
+async function set(name, value) {
+  clearTimeout(timer);
+  const d = await post('/api/set', {name, value});
+  if (d.error) say(d.error, true); else say('');
+  if (d.controls) render(d.controls);
+}
+
+async function profile(action) {
+  const d = await post('/api/profile', {action});
+  say(d.message || d.error || '', !d.ok);
+  if (d.controls) render(d.controls);
+}
+
+async function save() {
+  const d = await post('/api/save', {});
+  say(d.message || d.error || '', !d.ok);
+  if (d.controls) render(d.controls);
+}
+
+function renderProfiles(names) {
+  const box = document.getElementById('profiles');
+  box.innerHTML = '';
+  for (const n of [...(names || []), 'reset']) {
+    const b = document.createElement('button');
+    b.textContent = n;
+    b.onclick = () => profile(n);
+    box.append(b);
+  }
+}
+
+async function load() {
+  const d = await (await fetch('/api/controls')).json();
+  document.getElementById('dev').textContent = d.device || '';
+  renderProfiles(d.profiles);
+  render(d.controls || []);
+}
+load();
+</script></body></html>
+"""
+
+
+def bind(port: int, tries: int) -> ThreadingHTTPServer | None:
+    """Bind to port, or the next free one after it. 0 means any free port.
+
+    A fixed default is friendlier than a random port (the URL stays the same
+    between runs), but it does collide -- with a previous camtune you forgot to
+    stop, or anything else on 8787. Walking forward beats refusing to start.
+    """
+    candidates = [0] if port == 0 else range(port, port + max(1, tries))
+    for p in candidates:
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", p), Handler)
+        except OSError:
+            continue
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--port", type=int, default=None,
+                    help="port to listen on; 0 picks any free one "
+                         "(default: TUNE_PORT from camshare.conf, else 8787)")
+    ap.add_argument("--tries", type=int, default=20,
+                    help="how many consecutive ports to try if PORT is busy")
+    ap.add_argument("--device", default=None,
+                    help="real camera, where controls are set "
+                         "(default: from camshare.conf)")
+    ap.add_argument("--loopback", default=None,
+                    help="loopback to preview, so we do not fight camshare "
+                         "(default: the first one in camshare.conf)")
+    ap.add_argument("--camlight", default=None,
+                    help="path to camlight, for Save and the profile buttons")
+    args = ap.parse_args()
+
+    # Defaults come from the shared config rather than being duplicated here.
+    if args.port is None:
+        try:
+            args.port = int(conf("get", "TUNE_PORT") or 8787)
+        except ValueError:
+            args.port = 8787
+    if args.device is None:
+        args.device = conf("cam") or "/dev/camshare0"
+    if args.loopback is None:
+        devices = [d for d in conf("devices").splitlines() if d.strip()]
+        args.loopback = devices[0] if devices else "/dev/video70"
+    if args.camlight is None:
+        args.camlight = sibling("camlight")
+
+    for tool in ("v4l2-ctl", "gst-launch-1.0"):
+        if not shutil.which(tool):
+            print(f"camtune: {tool} not found in PATH", file=sys.stderr)
+            return 1
+
+    camlight = shutil.which(args.camlight) or args.camlight
+    Handler.cam = args.device
+    Handler.loop = args.loopback
+    Handler.camlight = camlight
+    Handler.profiles = [p for p in conf("profiles").splitlines() if p.strip()]
+
+    if not read_controls(args.device):
+        print(f"camtune: no controls readable on {args.device} -- is the camera "
+              f"present?", file=sys.stderr)
+        return 1
+
+    # 127.0.0.1 only. This exposes camera controls and a live video feed; it has
+    # no business being reachable from the network. Ports below 1024 would also
+    # need root, which this has no reason to have.
+    srv = bind(args.port, args.tries)
+    if srv is None:
+        print(f"camtune: no free port in {args.port}..{args.port + args.tries - 1}. "
+              f"Use --port 0 to let the OS pick one.", file=sys.stderr)
+        return 1
+    srv.daemon_threads = True
+
+    port = srv.server_address[1]
+    if args.port not in (0, port):
+        print(f"camtune: port {args.port} was busy, using {port}", flush=True)
+    print(f"camtune: http://127.0.0.1:{port}  "
+          f"(controls {args.device}, preview {args.loopback})", flush=True)
+    print("Ctrl-C to stop.", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\ncamtune: stopped")
+    finally:
+        srv.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
