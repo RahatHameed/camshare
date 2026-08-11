@@ -25,6 +25,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BOUNDARY = "camtune"
 
+# The fan-out service this UI can start and stop. Hardcoded rather than taken
+# from a request: this endpoint must never become a general systemctl proxy.
+UNIT = "camshare.service"
+
 # Controls camlight knows how to persist, in the order it applies them. Anything
 # outside this list is still adjustable live, it just will not be saved.
 SAVEABLE = [
@@ -67,6 +71,12 @@ def conf(*query: str) -> str:
         return ""
     rc, out = run([helper, *query])
     return out if rc == 0 else ""
+
+
+def service_state() -> str:
+    """active / inactive / failed, as systemd reports it."""
+    rc, out = run(["systemctl", "--user", "is-active", UNIT])
+    return out.splitlines()[0] if out else "unknown"
 
 
 def read_controls(cam: str) -> list[dict]:
@@ -142,7 +152,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/api/controls":
             self._json({"controls": read_controls(self.cam), "device": self.cam,
-                        "profiles": self.profiles})
+                        "profiles": self.profiles, "service": service_state()})
+        elif self.path == "/api/service":
+            # Cheap enough to poll: one systemctl call, no v4l2 access.
+            self._json({"state": service_state(), "unit": UNIT})
         elif self.path == "/stream.mjpg":
             self.stream()
         else:
@@ -191,6 +204,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": rc == 0, "message": out,
                                "controls": read_controls(self.cam)})
 
+        if self.path == "/api/service":
+            action = self._body().get("action", "")
+            if action not in ("start", "stop", "restart"):
+                return self._json({"error": f"bad action {action!r}"}, 400)
+            rc, out = run(["systemctl", "--user", action, UNIT])
+            done = {"start": "started", "stop": "stopped", "restart": "restarted"}
+            return self._json({"ok": rc == 0,
+                               "message": out or f"{done[action]} {UNIT}",
+                               "state": service_state()})
+
         if self.path == "/api/save":
             pairs = [f"{c['name']}={c['value']}"
                      for c in read_controls(self.cam)
@@ -204,6 +227,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def stream(self):
+        if service_state() != "active":
+            return self.send_error(
+                503, f"{UNIT} is not running, so there is nothing to preview")
         w, h, fps = self.preview
         cmd = [
             "gst-launch-1.0", "-q",
@@ -273,6 +299,21 @@ PAGE = """<!doctype html>
   .off { opacity:.38; }
   .off input { pointer-events:none; }
   .note { color:var(--dim); font-size:12px; margin-top:3px; }
+  .svc { display:flex; align-items:center; gap:9px; margin-bottom:10px;
+         flex-wrap:wrap; }
+  .pill { display:inline-flex; align-items:center; gap:6px; font-size:12px;
+          padding:3px 9px; border-radius:999px; border:1px solid var(--line);
+          background:var(--panel); }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); }
+  .dot.on { background:#5ec27a; }
+  .dot.off { background:#f0857d; }
+  .shade { position:relative; }
+  .shade .msg { position:absolute; inset:0; display:none; align-items:center;
+                justify-content:center; text-align:center; padding:20px;
+                background:#000c; border-radius:8px; color:var(--dim);
+                font-size:13px; line-height:1.6; }
+  .shade.stopped .msg { display:flex; }
+  .shade.stopped img { min-height:220px; }
   button { background:#2a2f37; color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:7px 13px; cursor:pointer; font-size:13px;
            margin:0 6px 6px 0; }
@@ -288,10 +329,21 @@ PAGE = """<!doctype html>
 <div class="wrap">
   <div class="left">
     <h1>camtune <span id="dev"></span></h1>
-    <img id="preview" src="/stream.mjpg" alt="live preview">
+    <div class="svc">
+      <span class="pill"><span class="dot" id="dot"></span>
+        <span id="svcstate">checking&hellip;</span></span>
+      <button id="svcbtn" onclick="toggleService()">&mdash;</button>
+      <button onclick="service('restart')">restart</button>
+    </div>
+    <div class="shade" id="shade">
+      <img id="preview" src="/stream.mjpg" alt="live preview">
+      <div class="msg">camshare is stopped &mdash; the camera is released and
+        its indicator light is off.<br>Start it to preview again. Apps launched
+        while it is stopped will not list the virtual cameras.</div>
+    </div>
     <div class="note">Preview reads a virtual camera &mdash; the same frames your
       apps get. Adjustments apply instantly; nothing persists until you press
-      Save.</div>
+      Save. Stopping camshare frees the real camera and turns its light off.</div>
   </div>
   <div class="right">
     <div class="panel">
@@ -304,6 +356,7 @@ PAGE = """<!doctype html>
 </div>
 <script>
 let timer = null;
+let svc = null;   // last known service state, so transitions can be detected
 
 function say(text, isErr) {
   const m = document.getElementById('msg');
@@ -400,13 +453,50 @@ function renderProfiles(names) {
   }
 }
 
+function renderService(state) {
+  const was = svc;
+  svc = state;
+  const running = state === 'active';
+  document.getElementById('svcstate').textContent = 'camshare ' + state;
+  document.getElementById('dot').className = 'dot ' + (running ? 'on' : 'off');
+  document.getElementById('svcbtn').textContent = running ? 'stop' : 'start';
+  document.getElementById('shade').className = 'shade' + (running ? '' : ' stopped');
+
+  // The MJPEG connection dies with the service, so it must be re-established
+  // rather than merely un-hidden -- and cache-busted, or the browser reuses
+  // the dead one and the preview stays blank.
+  const img = document.getElementById('preview');
+  if (running && was !== 'active') img.src = '/stream.mjpg?t=' + Math.floor(performance.now());
+  if (!running) img.removeAttribute('src');
+}
+
+async function service(action) {
+  say(action + 'ing camshare\u2026');
+  const d = await post('/api/service', {action});
+  say(d.message || d.error || '', !d.ok);
+  renderService(d.state || 'unknown');
+  // Starting needs a moment to preroll before the preview will connect.
+  if (action !== 'stop') setTimeout(pollService, 1500);
+}
+
+function toggleService() { service(svc === 'active' ? 'stop' : 'start'); }
+
+async function pollService() {
+  try {
+    const d = await (await fetch('/api/service')).json();
+    if (d.state !== svc) renderService(d.state);
+  } catch (e) { /* server gone; keep showing the last known state */ }
+}
+
 async function load() {
   const d = await (await fetch('/api/controls')).json();
   document.getElementById('dev').textContent = d.device || '';
   renderProfiles(d.profiles);
+  renderService(d.service || 'unknown');
   render(d.controls || []);
 }
 load();
+setInterval(pollService, 4000);
 </script></body></html>
 """
 

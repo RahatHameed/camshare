@@ -12,6 +12,12 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 - `camtune.service` with `make tune-enable` / `make tune-disable`, so the browser
   UI can survive reboots. Installed but not enabled by default; gstreamer is
   only spawned while a browser tab is connected, so it is idle at rest.
+- Start/stop controls for the fan-out in the browser UI, with a status pill. The
+  camera's indicator light is on whenever camshare runs, by design, and stopping
+  it is the only way to release the camera; the UI now makes that reachable
+  without a terminal. The preview shades over with an explanation while stopped,
+  and `/stream.mjpg` returns 503 rather than spawning gstreamer against a
+  loopback with no producer.
 
 ## [0.1.0] - 2026-08-11
 
