@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
 ## [0.1.0] - 2026-08-11
 
 First public version. Generalised from a single-machine setup into something

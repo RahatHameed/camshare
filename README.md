@@ -41,6 +41,7 @@ make tune             # live preview and sliders in your browser
 - [Field notes](#field-notes)
 - [Limitations](#limitations)
 - [Uninstall](#uninstall)
+- [Contributing](#contributing)
 
 ---
 
@@ -487,6 +488,12 @@ v4l2-ctl -d /dev/camshare0 --set-ctrl=auto_exposure=3,white_balance_automatic=1
 
 Then repoint your apps back at the real camera — they will not fall back on their
 own and will show black until you do.
+
+## Contributing
+
+Bug reports and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+`main` is protected, so changes go through a pull request with CI passing and a
+review. `make test` needs no camera.
 
 ## License
 
