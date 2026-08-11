@@ -8,12 +8,26 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Every preview reload 404'd. Routing compared `self.path`, which includes the
+  query string, so the cache-busting `?t=...` the page appends on each reload
+  never matched `/stream.mjpg`. Only the very first request, made without a
+  query, ever worked.
 - Clicking start in the browser UI left a broken preview. systemd reports the
   unit active the moment it forks, but gstreamer has not prerolled, so the
   stream endpoint sent 200 headers and then no data — which a browser treats as
   a permanently broken image and never retries. The endpoint now waits for real
   frames before committing to a 200 and returns 503 otherwise, and the page
   retries a bounded number of times while the service is meant to be running.
+  Retrying happens inside a single request: each attempt holds a v4l2loopback
+  opener while its gstreamer is torn down, so retrying from the browser piled
+  those up against `max_openers` until every attempt failed.
+- Requests are logged to the journal again, and gstreamer's stderr is reported
+  in the 503 body instead of being discarded. The underlying error was
+  `Device '/dev/videoN' is not a capture device`, which exclusive_caps produces
+  until the fan-out is actually pushing frames; discarding it cost two wrong
+  diagnoses.
+- The page is served with `Cache-Control: no-store`, so an open tab cannot keep
+  running JavaScript from an older camtune.
 
 ### Added
 

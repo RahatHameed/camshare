@@ -240,6 +240,13 @@ else
 
     is "stream is 200 once frames flow" "$(code "$URL/stream.mjpg")" "200"
 
+    # Regression: routing compared the raw path, which includes the query
+    # string, so the cache-busting ?t=... the page adds on every reload made
+    # each retry a 404. curl against the bare URL could never catch it.
+    is "stream honours a cache-busting query" "$(code "$URL/stream.mjpg?t=12345")" "200"
+    is "api honours a query string"           "$(code "$URL/api/service?t=1")" "200"
+    is "controls honour a query string"       "$(code "$URL/api/controls?t=1")" "200"
+
     body=$(curl -s --max-time 3 "$URL/stream.mjpg" | head -c 200)
     case $body in *FRAME*) ok "stream carries frame data" ;;
                   *) bad "stream carries frame data" "got: $body" ;; esac

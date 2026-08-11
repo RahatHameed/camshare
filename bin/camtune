@@ -19,6 +19,7 @@ import json
 import os
 import re
 import select
+import time
 import shutil
 import subprocess
 import sys
@@ -30,10 +31,17 @@ BOUNDARY = "camtune"
 # from a request: this endpoint must never become a general systemctl proxy.
 UNIT = "camshare.service"
 
-# How long to wait for gstreamer's first bytes before giving up on a preview.
-# Starting the fan-out reports "active" the moment systemd forks it, but frames
-# only appear once the pipeline has prerolled, which takes a second or so.
-FIRST_FRAME_TIMEOUT = 8.0
+# How long to keep trying for a first frame before giving up on a preview.
+#
+# Starting the fan-out reports "active" the moment systemd forks it, but until
+# its pipeline is actually pushing frames the loopback advertises output-only
+# under exclusive_caps, and opening it fails with "not a capture device". That
+# window is a second or two. Retrying is done *inside* one request rather than
+# by the browser: each attempt holds an opener while it is torn down, and
+# hammering from the client piles those up against v4l2loopback's max_openers
+# until every attempt fails.
+FIRST_FRAME_TIMEOUT = float(os.environ.get("CAMTUNE_FIRST_FRAME_TIMEOUT", "12"))
+ATTEMPT_TIMEOUT = 1.5   # per spawn, before deciding this one is not coming
 
 # Controls camlight knows how to persist, in the order it applies them. Anything
 # outside this list is still adjustable live, it just will not be saved.
@@ -126,8 +134,13 @@ class Handler(BaseHTTPRequestHandler):
     profiles: list[str] = []
     preview = (640, 360, 15)
 
-    def log_message(self, fmt, *args):  # quieter than the default one-line-per-hit
-        pass
+    # Logging goes to the journal (journalctl --user -u camtune). Requests are
+    # the only window into what a browser is actually doing, and suppressing
+    # them entirely made a preview bug much harder to diagnose than it needed
+    # to be.
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+        sys.stderr.flush()
 
     # -- helpers ----------------------------------------------------------
 
@@ -148,27 +161,38 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routes -----------------------------------------------------------
 
+    # self.path carries the query string, so routing must compare against the
+    # path alone. The preview is requested with a cache-busting ?t=... on every
+    # reload, and matching the raw path made every one of those a 404.
+    def route(self) -> str:
+        return self.path.split("?", 1)[0]
+
     def do_GET(self):
-        if self.path == "/":
+        path = self.route()
+        if path == "/":
             body = PAGE.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            # The page carries its own JavaScript, so a cached copy means an
+            # upgraded camtune still serves stale behaviour to an open tab.
+            self.send_header("Cache-Control", "no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/api/controls":
+        elif path == "/api/controls":
             self._json({"controls": read_controls(self.cam), "device": self.cam,
                         "profiles": self.profiles, "service": service_state()})
-        elif self.path == "/api/service":
+        elif path == "/api/service":
             # Cheap enough to poll: one systemctl call, no v4l2 access.
             self._json({"state": service_state(), "unit": UNIT})
-        elif self.path == "/stream.mjpg":
+        elif path == "/stream.mjpg":
             self.stream()
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path == "/api/set":
+        path = self.route()
+        if path == "/api/set":
             data = self._body()
             name, value = data.get("name"), data.get("value")
             if not name or value is None:
@@ -200,7 +224,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": rc == 0, "error": out if rc else "",
                                "controls": read_controls(self.cam)})
 
-        if self.path == "/api/profile":
+        if path == "/api/profile":
             action = self._body().get("action", "")
             # Profiles come from the config, so the UI is not limited to a fixed
             # set and a user-defined PROFILE_studio works without code changes.
@@ -210,7 +234,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": rc == 0, "message": out,
                                "controls": read_controls(self.cam)})
 
-        if self.path == "/api/service":
+        if path == "/api/service":
             action = self._body().get("action", "")
             if action not in ("start", "stop", "restart"):
                 return self._json({"error": f"bad action {action!r}"}, 400)
@@ -220,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
                                "message": out or f"{done[action]} {UNIT}",
                                "state": service_state()})
 
-        if self.path == "/api/save":
+        if path == "/api/save":
             pairs = [f"{c['name']}={c['value']}"
                      for c in read_controls(self.cam)
                      if c["saveable"] and not c["inactive"]]
@@ -248,31 +272,44 @@ class Handler(BaseHTTPRequestHandler):
             "!", "multipartmux", f"boundary={BOUNDARY}",
             "!", "fdsink", "fd=1",
         ]
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL)
-        except OSError as exc:
-            return self.send_error(500, f"gstreamer failed: {exc}")
+        def spawn():
+            return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
 
-        # Wait for real data before committing to a 200. Sending headers first
-        # and then producing nothing looks to a browser like a broken image, and
-        # it will not retry -- which is exactly what made "start" appear to do
-        # nothing while the pipeline was still coming up.
-        first = b""
-        try:
-            ready, _, _ = select.select([proc.stdout], [], [], FIRST_FRAME_TIMEOUT)
-            if ready:
-                first = os.read(proc.stdout.fileno(), 65536)
-        except OSError:
-            first = b""
-        if not first:
-            proc.terminate()
+        def reap(p):
+            p.terminate()
             try:
-                proc.wait(timeout=2)
+                _, err = p.communicate(timeout=2)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                p.kill()
+                err = b""
+            return err.decode(errors="replace").strip()
+
+        # One opener at a time, retried until the loopback has a producer.
+        proc, first, why = None, b"", ""
+        deadline = time.monotonic() + FIRST_FRAME_TIMEOUT
+        while time.monotonic() < deadline:
+            try:
+                proc = spawn()
+            except OSError as exc:
+                return self.send_error(500, f"gstreamer failed: {exc}")
+            try:
+                ready, _, _ = select.select([proc.stdout], [], [], ATTEMPT_TIMEOUT)
+                first = os.read(proc.stdout.fileno(), 65536) if ready else b""
+            except OSError:
+                first = b""
+            if first:
+                break
+            err = reap(proc)
+            if err:
+                why = err.splitlines()[0]
+            proc = None
+            time.sleep(0.4)
+
+        if not first:
             return self.send_error(
-                503, "no frames yet -- the pipeline may still be starting")
+                503, f"no frames from {self.loop} within "
+                     f"{FIRST_FRAME_TIMEOUT:.0f}s" + (f": {why}" if why else ""))
 
         self.send_response(200)
         self.send_header("Age", "0")
@@ -510,10 +547,17 @@ function reloadPreview() {
 function watchPreview() {
   const img = document.getElementById('preview');
   img.onerror = () => {
-    if (svc !== 'active' || previewTries >= 12) return;
+    // The server already retries internally for as long as the pipeline
+    // plausibly needs, so a failure here means something is genuinely wrong.
+    // Retry slowly and rarely: hammering piles up v4l2loopback openers, each
+    // held for as long as its gstreamer takes to die, until all attempts fail.
+    if (svc !== 'active' || previewTries >= 3) {
+      if (svc === 'active') say('preview unavailable, see camtune logs', true);
+      return;
+    }
     previewTries++;
-    say('waiting for the pipeline\u2026 (' + previewTries + ')');
-    setTimeout(reloadPreview, 1000);
+    say('waiting for the pipeline\u2026 (' + previewTries + '/3)');
+    setTimeout(reloadPreview, 2500);
   };
   img.onload = () => { previewTries = 0; say(''); };
 }
@@ -526,7 +570,7 @@ async function service(action) {
   // Starting needs a moment to preroll before the preview will connect. Kick a
   // reload explicitly: renderService only reloads on a state *transition*, and
   // by now the state already reads active.
-  if (action !== 'stop') { previewTries = 0; setTimeout(reloadPreview, 1200); }
+  if (action !== 'stop') { previewTries = 0; setTimeout(reloadPreview, 300); }
 }
 
 function toggleService() { service(svc === 'active' ? 'stop' : 'start'); }
