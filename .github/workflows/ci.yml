@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Syntax check
+        run: |
+          for f in bin/camshare.sh bin/camlight bin/camdetect bin/camgen bin/camshare-conf; do
+            bash -n "$f" && echo "$f OK"
+          done
+      - name: shellcheck
+        # SC1090/SC1091: camshare-conf is sourced by a path built at runtime,
+        # which shellcheck cannot follow.
+        run: shellcheck -e SC1090,SC1091 bin/camshare.sh bin/camlight bin/camdetect bin/camgen bin/camshare-conf
+
+  python:
+    name: camtune
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Compile
+        run: python -m py_compile bin/camtune
+      - name: Lint
+        run: |
+          pip install ruff
+          ruff check --select E9,F63,F7,F82 bin/camtune
+
+  config:
+    name: config + generators
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Example config parses
+        run: ./bin/camshare-conf dump
+      - name: Generators produce sane output
+        # No camera on a CI runner, so feed ids in and check the shape only.
+        run: |
+          set -euo pipefail
+          out=$(CAM_VENDOR=046d CAM_PRODUCT=086b CAM_LINK=testcam ./bin/camgen udev)
+          echo "$out"
+          echo "$out" | grep -q 'SYMLINK+="testcam"'
+          echo "$out" | grep -q 'ATTR{index}=="0"'
+          out=$(LOOPBACKS="70:A;71:B;72:C" ./bin/camgen modprobe)
+          echo "$out"
+          echo "$out" | grep -q 'devices=3'
+          echo "$out" | grep -q 'video_nr=70,71,72'
+          echo "$out" | grep -q 'exclusive_caps=1,1,1'
