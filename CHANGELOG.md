@@ -28,6 +28,10 @@ installable on any Linux box with a UVC camera.
   friends; `make` alone prints self-documenting help.
 - Configurable number of virtual cameras via `LOOPBACKS` in `camshare.conf`.
 - GitHub Actions CI running shellcheck and a Python compile check.
+- `make edit` to open the active config, and `make link`/`make unlink` to keep
+  the config in the checkout symlinked into `~/.config`, for tracking it in a
+  private fork. A dangling symlink is reported rather than silently falling back
+  to defaults.
 
 ### Fixed
 

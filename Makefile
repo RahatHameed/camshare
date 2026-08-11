@@ -53,6 +53,40 @@ detect: ## Find your camera and write a config for it
 config: ## Show the resolved configuration
 	@$(CONFQ) dump
 
+.PHONY: edit
+edit: ## Open the active config in $$EDITOR
+	@mkdir -p $(CONF_DIR)
+	@test -e $(CONF) || { cp camshare.conf.example $(CONF); \
+	  echo "seeded $(CONF)"; }
+	@$${EDITOR:-nano} $(CONF)
+	@echo; $(CONFQ) dump
+
+.PHONY: link
+link: ## Keep camshare.conf in this checkout, symlinked into ~/.config
+	@if [ ! -e camshare.conf ]; then \
+	  if [ -f $(CONF) ] && [ ! -L $(CONF) ]; then \
+	    cp $(CONF) camshare.conf; echo "copied existing config -> ./camshare.conf"; \
+	  else \
+	    cp camshare.conf.example camshare.conf; echo "seeded ./camshare.conf"; \
+	  fi; \
+	fi
+	@mkdir -p $(CONF_DIR)
+	@if [ -e $(CONF) ] && [ ! -L $(CONF) ]; then \
+	  mv $(CONF) $(CONF).bak; echo "previous file kept as $(CONF).bak"; \
+	fi
+	@ln -sfn $(CURDIR)/camshare.conf $(CONF)
+	@ls -l $(CONF)
+	@echo
+	@echo "Note: camshare.conf is gitignored, but it now lives in a git working"
+	@echo "tree -- 'git clean -xdf' would delete it. 'make unlink' undoes this."
+
+.PHONY: unlink
+unlink: ## Undo 'make link': copy the config back into ~/.config
+	@if [ -L $(CONF) ]; then \
+	  cp -L $(CONF) $(CONF).tmp && mv $(CONF).tmp $(CONF); \
+	  echo "$(CONF) is a real file again"; \
+	else echo "$(CONF) is not a symlink, nothing to do"; fi
+
 .PHONY: install
 install: ## Install scripts + user service, then start it
 	@mkdir -p $(CONF_DIR)

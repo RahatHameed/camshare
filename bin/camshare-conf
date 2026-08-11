@@ -37,10 +37,20 @@ PROFILE_evening=${PROFILE_evening:-140 500 3800 1 0}
 PROFILE_auto=${PROFILE_auto:-128 39 4500 3 1}
 
 camshare_conf_path() {
-    local here candidates=()
+    local here candidates=() xdg
     here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+    xdg=${XDG_CONFIG_HOME:-$HOME/.config}/camshare/camshare.conf
+
+    # `make link` points this at a checkout. Moving or cleaning that checkout
+    # leaves a dangling symlink, and silently falling back to the example's
+    # defaults would be a baffling way to find out.
+    if [ -L "$xdg" ] && [ ! -r "$xdg" ]; then
+        echo "camshare: $xdg is a broken symlink -> $(readlink "$xdg")" >&2
+        echo "camshare: re-run 'make link' from the checkout, or 'make edit'" >&2
+    fi
+
     [ -n "${CAMSHARE_CONF:-}" ] && candidates+=("$CAMSHARE_CONF")
-    candidates+=("${XDG_CONFIG_HOME:-$HOME/.config}/camshare/camshare.conf")
+    candidates+=("$xdg")
     candidates+=("/etc/camshare.conf")
     candidates+=("$here/../camshare.conf.example")
     local c

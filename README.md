@@ -64,6 +64,7 @@ sudo apt install v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-good
 git clone <your-fork> camshare && cd camshare
 
 make detect            # writes ~/.config/camshare/camshare.conf
+make edit              # labels, how many virtual cameras, resolution, fps
 make install-system    # sudo: udev rule + module options
 sudo modprobe -r v4l2loopback; sudo modprobe v4l2loopback   # or reboot
 make install           # scripts + user service, starts it
@@ -123,7 +124,7 @@ modern machine; a dozen is not the intended use.
 
 Everything lives in `~/.config/camshare/camshare.conf`, seeded from
 [`camshare.conf.example`](camshare.conf.example). `make config` prints what is
-actually resolved.
+actually resolved, and `make edit` opens it in `$EDITOR`.
 
 | key | meaning |
 |---|---|
@@ -138,6 +139,30 @@ actually resolved.
 
 `FPS` defaults to **30** on purpose: video-call apps re-encode to 30 or less
 anyway, and 60 doubles both USB and memory load for no visible gain in a call.
+
+### Keeping the config in the checkout
+
+If you would rather edit the config next to the code — handy when you track it in
+a private fork or dotfiles — `make link` moves it into the checkout and points
+`~/.config` at it:
+
+```bash
+make link      # ./camshare.conf  <-  ~/.config/camshare/camshare.conf
+make unlink    # undo: copy it back to ~/.config as a real file
+```
+
+`camshare.conf` is gitignored, so your camera's serial never gets committed by
+accident. Two things to keep in mind before choosing this:
+
+- The config now lives in a git working tree, so **`git clean -xdf` will delete
+  it**. `make link` prints this warning.
+- **Moving or deleting the checkout leaves a dangling symlink.** The scripts
+  detect that and say so loudly rather than silently falling back to the
+  example's defaults, which would leave you hunting for a camera named
+  `/dev/camshare0`.
+
+The plain `~/.config` file is the default and is simpler; use `make link` only if
+you want the config version-controlled alongside the code.
 
 ## Lighting profiles
 
@@ -257,7 +282,9 @@ Run `make` with no arguments for the full self-documenting list.
 | `detect` | find your camera, write a config |
 | `install` / `uninstall` | scripts + user service |
 | `install-system` / `uninstall-system` | udev rule + module options (sudo) |
-| `config` / `generated` | show resolved config; show the files that would be installed |
+| `config` / `edit` | show resolved config; open it in `$EDITOR` |
+| `link` / `unlink` | keep the config in the checkout, symlinked into `~/.config` |
+| `generated` | show the system files that would be installed |
 | `status` / `check` / `logs` | state; full diagnostic; follow the journal |
 | `start` / `stop` / `restart` | service control |
 | `day` / `evening` / `auto` / `light` | lighting profiles |
