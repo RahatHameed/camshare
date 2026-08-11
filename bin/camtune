@@ -638,8 +638,10 @@ def main() -> int:
     if args.device is None:
         args.device = conf("cam") or "/dev/camshare0"
     if args.loopback is None:
-        devices = [d for d in conf("devices").splitlines() if d.strip()]
-        args.loopback = devices[0] if devices else "/dev/video70"
+        # Always the dedicated preview device. Previewing a loopback an app is
+        # using shares this module's very small buffer pool between two
+        # streaming readers, and the app is the one that goes blank.
+        args.loopback = conf("tune-device") or "/dev/video70"
     if args.camlight is None:
         args.camlight = sibling("camlight")
 

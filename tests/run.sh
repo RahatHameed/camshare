@@ -185,6 +185,26 @@ rule=$(CAM_SERIAL=ABC123 "$ROOT/bin/camgen" udev | grep '^SUBSYSTEM')
 case $rule in *'ATTRS{serial}=="ABC123"'*) ok "serial clause added when set" ;;
               *) bad "serial clause added when set" "$rule" ;; esac
 
+# A dedicated preview device: camtune must never share a loopback with an app,
+# but it still has to be created by the module and fed by the fan-out.
+is "no preview device by default" \
+   "$("$ROOT/bin/camshare-conf" tune-device)" "/dev/video70"
+is "preview device is used when set" \
+   "$(TUNE_LOOPBACK='79:Preview' "$ROOT/bin/camshare-conf" tune-device)" "/dev/video79"
+is "preview device is not an app device" \
+   "$(TUNE_LOOPBACK='79:Preview' "$ROOT/bin/camshare-conf" devices | tr '\n' ' ')" \
+   "/dev/video70 /dev/video71 "
+is "preview device is fed by the fan-out" \
+   "$(TUNE_LOOPBACK='79:Preview' "$ROOT/bin/camshare-conf" loopbacks | tail -1)" "79 Preview"
+is "module must create it too" \
+   "$(TUNE_LOOPBACK='79:Preview' "$ROOT/bin/camshare-conf" count)" "3"
+
+pv=$(TUNE_LOOPBACK="79:Preview" "$ROOT/bin/camgen" modprobe)
+case $pv in *"video_nr=70,71,79"*) ok "modprobe includes the preview device" ;;
+            *) bad "modprobe includes the preview device" "$pv" ;; esac
+case $pv in *"exclusive_caps=1,1,1"*) ok "caps cover the preview device" ;;
+            *) bad "caps cover the preview device" "$pv" ;; esac
+
 mp=$(LOOPBACKS="70:A;71:B;72:C" "$ROOT/bin/camgen" modprobe)
 case $mp in *"devices=3"*)            ok "modprobe device count" ;; *) bad "modprobe device count" "$mp" ;; esac
 case $mp in *"video_nr=70,71,72"*)    ok "modprobe video_nr" ;;    *) bad "modprobe video_nr" "$mp" ;; esac

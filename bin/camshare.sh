@@ -76,10 +76,22 @@ pipeline=(
     ! tee name=t
 )
 
+# The preview device is a convenience; the app-facing ones are the point. A
+# missing preview device must not take the whole fan-out down, which would
+# otherwise happen in the window between configuring TUNE_LOOPBACK and
+# reloading v4l2loopback to actually create it.
+TUNE_NUM=$(camshare_tune_entry | awk '{print $1}')
+
 count=0
 while read -r num label; do
     [ -n "$num" ] || continue
     if [ ! -e "/dev/video$num" ]; then
+        if [ -n "$TUNE_NUM" ] && [ "$num" = "$TUNE_NUM" ]; then
+            echo "camshare: preview device /dev/video$num missing, carrying on" \
+                 "without it -- run 'make install-system' and reload" \
+                 "v4l2loopback to create it" >&2
+            continue
+        fi
         echo "camshare: /dev/video$num missing -- is v4l2loopback loaded with" \
              "the right video_nr? try: make install-system" >&2
         exit 1
@@ -87,7 +99,7 @@ while read -r num label; do
     pipeline+=(t. ! queue ! v4l2sink "device=/dev/video$num" sync=false)
     count=$((count + 1))
     echo "camshare: /dev/video$num <- $label" >&2
-done < <(camshare_loopbacks)
+done < <(camshare_all_loopbacks)
 
 if [ "$count" -eq 0 ]; then
     echo "camshare: LOOPBACKS is empty, nothing to feed" >&2

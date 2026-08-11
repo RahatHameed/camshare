@@ -160,6 +160,7 @@ actually resolved, and `make edit` opens it in `$EDITOR`.
 | `LOOPBACKS` | `number:label` per virtual camera, semicolon separated. |
 | `WIDTH`, `HEIGHT`, `FPS` | Capture format. Only sizes listed under MJPG by `make formats` are valid. |
 | `TUNE_PORT` | Port for the browser UI. Default 8787. |
+| `TUNE_LOOPBACK` | A virtual camera used only by the preview, as `number:label`. |
 | `STICKY_CONTROLS` | Controls a profile switch must not reset to default. |
 | `PROFILE_<name>` | A lighting profile. Add your own; no code change needed. |
 | `DEFAULT_PROFILE` | Applied when nothing has been chosen yet. |
@@ -284,8 +285,13 @@ preview shades over with an explanation while it is stopped, since there is
 nothing to show. Note that apps *launched* while it is stopped will not list the
 virtual cameras at all.
 
-- **The preview reads a virtual camera, not the real one**, so it never contends
-  with the fan-out and shows exactly the frames your apps receive.
+- **The preview reads its own virtual camera**, `TUNE_LOOPBACK`, so it never
+  contends with the fan-out *or* with an app. Sharing a loopback with an app is
+  a bad idea: this module is loaded with `max_buffers=2` by default, so a writer
+  plus two streaming readers contend for almost nothing, and the symptom is that
+  the app goes blank while the preview looks perfect. Adding or changing this
+  device needs `make install-system` and a module reload, which means stopping
+  camshare first — its own pipeline holds the module open.
 - Sliders apply immediately; nothing is written to disk until you press
   **Save to camlight**.
 - Profile buttons are generated from your config and call `camlight` directly, so

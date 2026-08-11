@@ -55,6 +55,15 @@ FPS=30
 # or anything else -- it walks forward to the next free one and tells you.
 TUNE_PORT=8787
 
+# A virtual camera used *only* by camtune's preview, as "number:label".
+#
+# Give the preview its own device. v4l2loopback is loaded with a very small
+# buffer pool (max_buffers=2 by default), so a writer plus two streaming readers
+# contend for almost nothing -- and the symptom is that the app sharing the
+# device goes blank while the preview looks fine. Leave this empty only if you
+# are willing to live with that.
+TUNE_LOOPBACK="79:CamShare WebTune"
+
 # -------------------------------------------------------- lighting profiles ---
 
 # Fields, in order: brightness exposure wb_temp auto_exposure auto_wb

@@ -16,7 +16,8 @@
 # scripts awkward to test.
 declare -A _CAMSHARE_ENV=()
 for _k in CAM_VENDOR CAM_PRODUCT CAM_SERIAL CAM_LINK LOOPBACKS \
-          WIDTH HEIGHT FPS TUNE_PORT DEFAULT_PROFILE STICKY_CONTROLS; do
+          WIDTH HEIGHT FPS TUNE_PORT TUNE_LOOPBACK DEFAULT_PROFILE \
+          STICKY_CONTROLS; do
     [ -n "${!_k+set}" ] && _CAMSHARE_ENV[$_k]=${!_k}
 done
 unset _k
@@ -31,6 +32,7 @@ WIDTH=${WIDTH:-1920}
 HEIGHT=${HEIGHT:-1080}
 FPS=${FPS:-30}
 TUNE_PORT=${TUNE_PORT:-8787}
+TUNE_LOOPBACK=${TUNE_LOOPBACK:-}
 DEFAULT_PROFILE=${DEFAULT_PROFILE:-auto}
 STICKY_CONTROLS=${STICKY_CONTROLS:-power_line_frequency}
 PROFILE_day=${PROFILE_day:-128 250 5000 1 0}
@@ -96,10 +98,23 @@ camshare_loopbacks() {
     done
 }
 
+# The preview device, when one is configured. camtune previewing a loopback that
+# an app is also using is at best a confound and at worst starves it: this module
+# is loaded with max_buffers=2, so a writer plus two streaming readers contend
+# for very little. A device of its own removes the interaction entirely.
+camshare_tune_entry() { [ -n "$TUNE_LOOPBACK" ] && printf '%s %s\n' "${TUNE_LOOPBACK%%:*}" "${TUNE_LOOPBACK#*:}"; }
+camshare_tune_device() {
+    [ -n "$TUNE_LOOPBACK" ] && { printf '/dev/video%s' "${TUNE_LOOPBACK%%:*}"; return 0; }
+    camshare_devices | head -1
+}
+
+# Everything camshare must feed: the app-facing loopbacks plus the preview one.
+camshare_all_loopbacks() { camshare_loopbacks; camshare_tune_entry; }
+
 camshare_devices()    { camshare_loopbacks | awk '{print "/dev/video" $1}'; }
-camshare_numbers()    { camshare_loopbacks | awk '{print $1}' | paste -sd, -; }
-camshare_labels()     { camshare_loopbacks | cut -d' ' -f2- | paste -sd, -; }
-camshare_count()      { camshare_loopbacks | grep -c . ; }
+camshare_numbers()    { camshare_all_loopbacks | awk '{print $1}' | paste -sd, -; }
+camshare_labels()     { camshare_all_loopbacks | cut -d' ' -f2- | paste -sd, -; }
+camshare_count()      { camshare_all_loopbacks | grep -c . ; }
 camshare_profile()    { eval "printf '%s' \"\${PROFILE_$1:-}\""; }
 camshare_profiles()   { compgen -A variable PROFILE_ | sed 's/^PROFILE_//' | sort; }
 
@@ -114,7 +129,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         numbers)   camshare_numbers ;;
         labels)    camshare_labels ;;
         count)     camshare_count ;;
-        loopbacks) camshare_loopbacks ;;
+        loopbacks) camshare_all_loopbacks ;;
+        tune-device) camshare_tune_device; echo ;;
         profile)   camshare_profile "${2:-}"; echo ;;
         profiles)  camshare_profiles ;;
         get)       eval "printf '%s\n' \"\${${2:-}:-}\"" ;;
@@ -125,6 +141,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             echo "default:   $DEFAULT_PROFILE"
             echo "loopbacks: $(camshare_count)"
             camshare_loopbacks | while read -r n l; do echo "  /dev/video$n  $l"; done
+            [ -n "$TUNE_LOOPBACK" ] && echo "preview:   $(camshare_tune_device)  ${TUNE_LOOPBACK#*:}"
             # Printed so that a config edit which silently drops tuned profile
             # values is visible here rather than only in the picture.
             echo "profiles:"

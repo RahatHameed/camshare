@@ -31,6 +31,11 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `TUNE_LOOPBACK`: a virtual camera used only by camtune's preview, so the
+  tuning UI never shares a loopback with an application. Sharing one made the
+  app go blank while the preview looked fine. A missing preview device is a
+  warning rather than fatal, so configuring it cannot take the fan-out down
+  in the window before the module is reloaded.
 - CI and license badges in the README.
 - `camtune.service` with `make tune-enable` / `make tune-disable`, so the browser
   UI can survive reboots. Installed but not enabled by default; gstreamer is

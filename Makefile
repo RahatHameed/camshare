@@ -28,6 +28,7 @@ CONFQ     := $(CURDIR)/bin/camshare-conf
 CAM       ?= $(shell $(CONFQ) cam 2>/dev/null)
 DEVICES   := $(shell $(CONFQ) devices 2>/dev/null)
 FIRST_DEV := $(firstword $(DEVICES))
+TUNE_DEV  := $(shell $(CONFQ) tune-device 2>/dev/null)
 CAMLIGHT  ?= $(PREFIX)/camlight
 CAMTUNE   ?= $(PREFIX)/camtune
 TUNE_PORT ?= $(shell $(CONFQ) get TUNE_PORT 2>/dev/null)
@@ -194,7 +195,7 @@ tune-disable: ## Stop the browser UI service and leave it stopped
 	@echo "stopped; 'make tune' still runs it in the foreground"
 
 tune: ## Live preview + sliders in a browser (Ctrl-C to stop)
-	@$(CAMTUNE) --port $(TUNE_PORT) --loopback $(FIRST_DEV) \
+	@$(CAMTUNE) --port $(TUNE_PORT) --loopback $(TUNE_DEV) \
 	            --device $(CAM) --camlight $(CAMLIGHT)
 
 # ------------------------------------------------------------ diagnostics ---
