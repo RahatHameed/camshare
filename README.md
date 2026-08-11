@@ -277,7 +277,19 @@ Live preview with a slider per control. The point is iteration speed: from the
 CLI, tuning means set → snapshot → look → adjust, several seconds a round. Here
 the preview updates as you drag.
 
-It also carries a **status pill and start/stop buttons** for the fan-out service.
+**Pause preview** stops only this page's preview and frees the preview device.
+Your applications are untouched — it is the safe button. **Stop all sharing**
+stops the fan-out itself, which takes down *every* virtual camera and releases
+the real camera, turning its indicator light off; it asks for confirmation
+first, because losing every camera is rarely what you meant by "stop".
+
+Only one process may read a virtual camera at a time on this driver: a second
+reader gets `Device is busy`, and if the first one is an application, the
+application is the one that goes blank. camtune therefore keeps at most one
+preview pipeline alive and replaces it on each request rather than accumulating
+readers.
+
+The status pill also carries the fan-out's state.
 That is the answer to "why is my camera light on when I am not in a meeting?" —
 camshare holds the camera open continuously by design, so that apps cannot steal
 the real device, and stopping it releases the camera and turns the light off. The

@@ -283,6 +283,20 @@ else
     is "unknown action rejected" \
        "$(code -X POST -H 'Content-Type: application/json' -d '{"action":"disable"}' "$URL/api/service")" "400"
 
+    # Pausing must affect only the preview. Stopping the fan-out takes every
+    # application's camera down with it, which is not what a page-level
+    # "stop" should ever mean.
+    echo active >"$FAKE_SVC_STATE"
+    post "$URL/api/preview" '{"action":"pause"}' >/dev/null
+    is "paused preview refuses to stream" "$(code "$URL/stream.mjpg")" "503"
+    is "pausing leaves the fan-out running" "$(cat "$FAKE_SVC_STATE")" "active"
+    is "pause is reported in the state" \
+       "$(curl -s --max-time 5 "$URL/api/service" | sed -n 's/.*"preview": "\([a-z]*\)".*/\1/p')" "paused"
+    post "$URL/api/preview" '{"action":"resume"}' >/dev/null
+    is "resumed preview streams again" "$(code "$URL/stream.mjpg")" "200"
+    is "unknown preview action rejected" \
+       "$(code -X POST -H 'Content-Type: application/json' -d '{"action":"nope"}' "$URL/api/preview")" "400"
+
     # The client half cannot be driven headlessly, so assert the retry wiring is
     # at least present: without it a single early failure is never retried.
     page=$(curl -s --max-time 5 "$URL/")

@@ -8,6 +8,14 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The browser UI's stop button stopped the whole fan-out, taking every
+  application's camera down. Pausing the preview is now the primary control and
+  affects only this page; stopping the fan-out is a separate, confirmed action.
+- camtune could leave a stale gstreamer holding the preview device. Since this
+  driver allows only one reader per device, that locked camtune out of its own
+  preview and every retry failed with `Device is busy`. Exactly one preview
+  pipeline is now tracked and replaced per request.
+
 - Every preview reload 404'd. Routing compared `self.path`, which includes the
   query string, so the cache-busting `?t=...` the page appends on each reload
   never matched `/stream.mjpg`. Only the very first request, made without a

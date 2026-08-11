@@ -19,6 +19,7 @@ import json
 import os
 import re
 import select
+import threading
 import time
 import shutil
 import subprocess
@@ -42,6 +43,41 @@ UNIT = "camshare.service"
 # until every attempt fails.
 FIRST_FRAME_TIMEOUT = float(os.environ.get("CAMTUNE_FIRST_FRAME_TIMEOUT", "12"))
 ATTEMPT_TIMEOUT = 1.5   # per spawn, before deciding this one is not coming
+
+# This v4l2loopback allows exactly ONE reader per device at a time: a second
+# one fails with "Device is busy". So the preview must never leave a stray
+# gstreamer behind, or camtune locks itself out of its own device and every
+# retry fails forever. Exactly one is tracked, and a new request replaces it.
+_preview_lock = threading.Lock()
+_preview_proc = None
+_preview_paused = False
+
+
+def _kill(proc) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def claim_preview(proc):
+    """Register proc as the one preview reader, retiring any predecessor."""
+    global _preview_proc
+    with _preview_lock:
+        old, _preview_proc = _preview_proc, proc
+    if old is not proc:
+        _kill(old)
+
+
+def release_preview(proc) -> None:
+    global _preview_proc
+    with _preview_lock:
+        if _preview_proc is proc:
+            _preview_proc = None
+    _kill(proc)
 
 # Controls camlight knows how to persist, in the order it applies them. Anything
 # outside this list is still adjustable live, it just will not be saved.
@@ -184,7 +220,8 @@ class Handler(BaseHTTPRequestHandler):
                         "profiles": self.profiles, "service": service_state()})
         elif path == "/api/service":
             # Cheap enough to poll: one systemctl call, no v4l2 access.
-            self._json({"state": service_state(), "unit": UNIT})
+            self._json({"state": service_state(), "unit": UNIT,
+                        "preview": "paused" if _preview_paused else "running"})
         elif path == "/stream.mjpg":
             self.stream()
         else:
@@ -234,6 +271,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": rc == 0, "message": out,
                                "controls": read_controls(self.cam)})
 
+        if path == "/api/preview":
+            # Pausing affects only this preview -- never the fan-out, so the
+            # cameras your applications are using keep working.
+            global _preview_paused
+            action = self._body().get("action", "")
+            if action not in ("pause", "resume"):
+                return self._json({"error": f"bad action {action!r}"}, 400)
+            _preview_paused = action == "pause"
+            if _preview_paused:
+                claim_preview(None)     # drop the reader, freeing the device
+            return self._json({"ok": True, "preview": action + "d",
+                               "paused": _preview_paused})
+
         if path == "/api/service":
             action = self._body().get("action", "")
             if action not in ("start", "stop", "restart"):
@@ -257,6 +307,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def stream(self):
+        if _preview_paused:
+            return self.send_error(503, "preview paused")
         if service_state() != "active":
             return self.send_error(
                 503, f"{UNIT} is not running, so there is nothing to preview")
@@ -272,9 +324,15 @@ class Handler(BaseHTTPRequestHandler):
             "!", "multipartmux", f"boundary={BOUNDARY}",
             "!", "fdsink", "fd=1",
         ]
+        # Evict any previous reader before trying: it may be a stale pipeline
+        # from a tab that went away, and it would make every attempt fail.
+        claim_preview(None)
+
         def spawn():
-            return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
+            claim_preview(proc)
+            return proc
 
         def reap(p):
             p.terminate()
@@ -303,6 +361,7 @@ class Handler(BaseHTTPRequestHandler):
             err = reap(proc)
             if err:
                 why = err.splitlines()[0]
+            release_preview(proc)
             proc = None
             time.sleep(0.4)
 
@@ -327,11 +386,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # browser navigated away; expected
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            release_preview(proc)
 
 
 PAGE = """<!doctype html>
@@ -396,14 +451,12 @@ PAGE = """<!doctype html>
     <div class="svc">
       <span class="pill"><span class="dot" id="dot"></span>
         <span id="svcstate">checking&hellip;</span></span>
+      <button id="pvbtn" onclick="togglePreview()">pause preview</button>
       <button id="svcbtn" onclick="toggleService()">&mdash;</button>
-      <button onclick="service('restart')">restart</button>
     </div>
     <div class="shade" id="shade">
       <img id="preview" src="/stream.mjpg" alt="live preview">
-      <div class="msg">camshare is stopped &mdash; the camera is released and
-        its indicator light is off.<br>Start it to preview again. Apps launched
-        while it is stopped will not list the virtual cameras.</div>
+      <div class="msg" id="shademsg"></div>
     </div>
     <div class="note">Preview reads a virtual camera &mdash; the same frames your
       apps get. Adjustments apply instantly; nothing persists until you press
@@ -422,6 +475,7 @@ PAGE = """<!doctype html>
 let timer = null;
 let svc = null;      // last known service state, so transitions can be detected
 let previewTries = 0;  // bounded retries while the pipeline prerolls
+let paused = false;    // preview only; never the fan-out
 
 function say(text, isErr) {
   const m = document.getElementById('msg');
@@ -518,18 +572,35 @@ function renderProfiles(names) {
   }
 }
 
-function renderService(state) {
+function renderService(state, previewState) {
   const was = svc;
   svc = state;
+  if (previewState !== undefined) paused = previewState === 'paused';
   const running = state === 'active';
-  document.getElementById('svcstate').textContent = 'camshare ' + state;
+  const live = running && !paused;
+  document.getElementById('svcstate').textContent =
+    'camshare ' + state + (paused ? ', preview paused' : '');
   document.getElementById('dot').className = 'dot ' + (running ? 'on' : 'off');
-  document.getElementById('svcbtn').textContent = running ? 'stop' : 'start';
-  document.getElementById('shade').className = 'shade' + (running ? '' : ' stopped');
+  // Deliberately explicit: this stops every virtual camera, not just this page.
+  document.getElementById('svcbtn').textContent =
+    running ? 'stop all sharing' : 'start sharing';
+  document.getElementById('pvbtn').textContent = paused ? 'resume preview' : 'pause preview';
+  document.getElementById('shademsg').innerHTML = running
+    ? 'Preview paused. Only this preview is stopped &mdash; your apps keep working.'
+    : 'camshare is stopped &mdash; every virtual camera is down and the camera\'s '
+      + 'indicator light is off.<br>Apps launched while it is stopped will not '
+      + 'list the virtual cameras.';
+  document.getElementById('shade').className = 'shade' + (live ? '' : ' stopped');
 
   const img = document.getElementById('preview');
-  if (running && was !== 'active') { previewTries = 0; reloadPreview(); }
-  if (!running) { img.removeAttribute('src'); previewTries = 0; }
+  if (live && (was !== 'active' || !img.getAttribute('src'))) { previewTries = 0; reloadPreview(); }
+  if (!live) { img.removeAttribute('src'); previewTries = 0; }
+}
+
+async function togglePreview() {
+  const d = await post('/api/preview', {action: paused ? 'resume' : 'pause'});
+  say(d.error || ('preview ' + (d.paused ? 'paused' : 'resumed')), !d.ok);
+  renderService(svc, d.paused ? 'paused' : 'running');
 }
 
 // The MJPEG connection dies with the service, so it must be re-established
@@ -573,12 +644,19 @@ async function service(action) {
   if (action !== 'stop') { previewTries = 0; setTimeout(reloadPreview, 300); }
 }
 
-function toggleService() { service(svc === 'active' ? 'stop' : 'start'); }
+function toggleService() {
+  if (svc === 'active' &&
+      !confirm('Stop camshare?\n\nThis stops EVERY virtual camera, so Slack, '
+             + 'Teams and anything else lose their camera. To stop only this '
+             + 'preview, use "pause preview".')) return;
+  service(svc === 'active' ? 'stop' : 'start');
+}
 
 async function pollService() {
   try {
     const d = await (await fetch('/api/service')).json();
-    if (d.state !== svc) renderService(d.state);
+    const p = d.preview === 'paused';
+    if (d.state !== svc || p !== paused) renderService(d.state, d.preview);
   } catch (e) { /* server gone; keep showing the last known state */ }
 }
 
@@ -586,7 +664,7 @@ async function load() {
   const d = await (await fetch('/api/controls')).json();
   document.getElementById('dev').textContent = d.device || '';
   renderProfiles(d.profiles);
-  renderService(d.service || 'unknown');
+  renderService(d.service || 'unknown', d.preview);
   render(d.controls || []);
 }
 watchPreview();

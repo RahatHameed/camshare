@@ -62,8 +62,15 @@ jobs:
           echo "$out"
           echo "$out" | grep -q 'SYMLINK+="testcam"'
           echo "$out" | grep -q 'ATTR{index}=="0"'
-          out=$(LOOPBACKS="70:A;71:B;72:C" ./bin/camgen modprobe)
+          # TUNE_LOOPBACK is emptied here: the shipped example defines a
+          # preview device, which legitimately adds a fourth entry.
+          out=$(LOOPBACKS="70:A;71:B;72:C" TUNE_LOOPBACK="" ./bin/camgen modprobe)
           echo "$out"
           echo "$out" | grep -q 'devices=3'
           echo "$out" | grep -q 'video_nr=70,71,72'
           echo "$out" | grep -q 'exclusive_caps=1,1,1'
+          # ...and with a preview device it must be created by the module too.
+          out=$(LOOPBACKS="70:A;71:B" TUNE_LOOPBACK="79:Preview" ./bin/camgen modprobe)
+          echo "$out"
+          echo "$out" | grep -q 'devices=3'
+          echo "$out" | grep -q 'video_nr=70,71,79'
