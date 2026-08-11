@@ -192,6 +192,80 @@ case $mp in *"exclusive_caps=1,1,1"*) ok "exclusive_caps per device" ;; *) bad "
 teardown
 
 # ---------------------------------------------------------------------------
+# camtune's HTTP contract, against fake systemctl and gstreamer.
+#
+# Regression: clicking "start" in the UI left a broken preview. systemd reports
+# the unit active the moment it forks, but gstreamer has not prerolled yet, so
+# the stream endpoint used to send 200 headers and then no data. A browser
+# treats that as a permanently broken image and never retries.
+echo
+echo "camtune HTTP contract"
+setup
+export FAKE_SVC_STATE=$SANDBOX/svcstate
+export FAKE_GST_MODE_FILE=$SANDBOX/gstmode
+echo active >"$FAKE_SVC_STATE"
+echo frames >"$FAKE_GST_MODE_FILE"
+
+CAMTUNE_LOG=$SANDBOX/camtune.log
+"$ROOT/bin/camtune" --port 0 --device "$CAM" \
+    --loopback "$CAM" >"$CAMTUNE_LOG" 2>&1 &
+CAMTUNE_PID=$!
+URL=""
+for _ in $(seq 1 100); do
+    URL=$(sed -n 's|.*\(http://127.0.0.1:[0-9]*\).*|\1|p' "$CAMTUNE_LOG" 2>/dev/null | head -1)
+    [ -n "$URL" ] && curl -s -o /dev/null --max-time 1 "$URL/api/service" && break
+    sleep 0.1
+done
+
+code() { curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$@"; }
+post() { curl -s --max-time 6 -X POST -H 'Content-Type: application/json' -d "$2" "$1"; }
+
+if [ -z "$URL" ]; then
+    bad "camtune started" "no URL in $CAMTUNE_LOG: $(cat "$CAMTUNE_LOG")"
+else
+    ok "camtune started on $URL"
+
+    is "reports the service state" \
+       "$(curl -s --max-time 5 "$URL/api/service" | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p')" "active"
+
+    # The bug, from the server side: never answer 200 without frames.
+    echo inactive >"$FAKE_SVC_STATE"
+    is "stream is 503 while the service is stopped" "$(code "$URL/stream.mjpg")" "503"
+
+    echo active >"$FAKE_SVC_STATE"
+    echo silent >"$FAKE_GST_MODE_FILE"
+    is "stream is 503 when the pipeline yields nothing" \
+       "$(code "$URL/stream.mjpg")" "503"
+    echo frames >"$FAKE_GST_MODE_FILE"
+
+    is "stream is 200 once frames flow" "$(code "$URL/stream.mjpg")" "200"
+
+    body=$(curl -s --max-time 3 "$URL/stream.mjpg" | head -c 200)
+    case $body in *FRAME*) ok "stream carries frame data" ;;
+                  *) bad "stream carries frame data" "got: $body" ;; esac
+
+    # Service control endpoint.
+    is "stop is accepted" \
+       "$(post "$URL/api/service" '{"action":"stop"}' | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p')" "inactive"
+    is "start is accepted" \
+       "$(post "$URL/api/service" '{"action":"start"}' | sed -n 's/.*"state": "\([a-z]*\)".*/\1/p')" "active"
+    is "unknown action rejected" \
+       "$(code -X POST -H 'Content-Type: application/json' -d '{"action":"disable"}' "$URL/api/service")" "400"
+
+    # The client half cannot be driven headlessly, so assert the retry wiring is
+    # at least present: without it a single early failure is never retried.
+    page=$(curl -s --max-time 5 "$URL/")
+    for marker in 'reloadPreview' 'img.onerror' 'previewTries'; do
+        case $page in *"$marker"*) ok "page wires up $marker" ;;
+                      *) bad "page wires up $marker" ;; esac
+    done
+fi
+
+kill "$CAMTUNE_PID" 2>/dev/null
+wait "$CAMTUNE_PID" 2>/dev/null
+teardown
+
+# ---------------------------------------------------------------------------
 echo
 printf '%d passed, %d failed\n\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

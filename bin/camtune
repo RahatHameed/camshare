@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,11 @@ BOUNDARY = "camtune"
 # The fan-out service this UI can start and stop. Hardcoded rather than taken
 # from a request: this endpoint must never become a general systemctl proxy.
 UNIT = "camshare.service"
+
+# How long to wait for gstreamer's first bytes before giving up on a preview.
+# Starting the fan-out reports "active" the moment systemd forks it, but frames
+# only appear once the pipeline has prerolled, which takes a second or so.
+FIRST_FRAME_TIMEOUT = 8.0
 
 # Controls camlight knows how to persist, in the order it applies them. Anything
 # outside this list is still adjustable live, it just will not be saved.
@@ -248,6 +254,26 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             return self.send_error(500, f"gstreamer failed: {exc}")
 
+        # Wait for real data before committing to a 200. Sending headers first
+        # and then producing nothing looks to a browser like a broken image, and
+        # it will not retry -- which is exactly what made "start" appear to do
+        # nothing while the pipeline was still coming up.
+        first = b""
+        try:
+            ready, _, _ = select.select([proc.stdout], [], [], FIRST_FRAME_TIMEOUT)
+            if ready:
+                first = os.read(proc.stdout.fileno(), 65536)
+        except OSError:
+            first = b""
+        if not first:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return self.send_error(
+                503, "no frames yet -- the pipeline may still be starting")
+
         self.send_response(200)
         self.send_header("Age", "0")
         self.send_header("Cache-Control", "no-cache, private")
@@ -255,6 +281,7 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
         self.end_headers()
         try:
+            self.wfile.write(first)
             while True:
                 chunk = proc.stdout.read(8192)
                 if not chunk:
@@ -356,7 +383,8 @@ PAGE = """<!doctype html>
 </div>
 <script>
 let timer = null;
-let svc = null;   // last known service state, so transitions can be detected
+let svc = null;      // last known service state, so transitions can be detected
+let previewTries = 0;  // bounded retries while the pipeline prerolls
 
 function say(text, isErr) {
   const m = document.getElementById('msg');
@@ -462,12 +490,32 @@ function renderService(state) {
   document.getElementById('svcbtn').textContent = running ? 'stop' : 'start';
   document.getElementById('shade').className = 'shade' + (running ? '' : ' stopped');
 
-  // The MJPEG connection dies with the service, so it must be re-established
-  // rather than merely un-hidden -- and cache-busted, or the browser reuses
-  // the dead one and the preview stays blank.
   const img = document.getElementById('preview');
-  if (running && was !== 'active') img.src = '/stream.mjpg?t=' + Math.floor(performance.now());
-  if (!running) img.removeAttribute('src');
+  if (running && was !== 'active') { previewTries = 0; reloadPreview(); }
+  if (!running) { img.removeAttribute('src'); previewTries = 0; }
+}
+
+// The MJPEG connection dies with the service, so it must be re-established
+// rather than merely un-hidden -- and cache-busted, or the browser reuses the
+// dead one and the preview stays blank.
+function reloadPreview() {
+  const img = document.getElementById('preview');
+  img.src = '/stream.mjpg?t=' + Math.floor(performance.now());
+}
+
+// Starting reports "active" as soon as systemd forks the process, but frames
+// only appear once gstreamer has prerolled. Until then the server answers 503,
+// so a single attempt loses the race and the browser shows a broken image
+// forever. Retry, bounded, for as long as the service is meant to be running.
+function watchPreview() {
+  const img = document.getElementById('preview');
+  img.onerror = () => {
+    if (svc !== 'active' || previewTries >= 12) return;
+    previewTries++;
+    say('waiting for the pipeline\u2026 (' + previewTries + ')');
+    setTimeout(reloadPreview, 1000);
+  };
+  img.onload = () => { previewTries = 0; say(''); };
 }
 
 async function service(action) {
@@ -475,8 +523,10 @@ async function service(action) {
   const d = await post('/api/service', {action});
   say(d.message || d.error || '', !d.ok);
   renderService(d.state || 'unknown');
-  // Starting needs a moment to preroll before the preview will connect.
-  if (action !== 'stop') setTimeout(pollService, 1500);
+  // Starting needs a moment to preroll before the preview will connect. Kick a
+  // reload explicitly: renderService only reloads on a state *transition*, and
+  // by now the state already reads active.
+  if (action !== 'stop') { previewTries = 0; setTimeout(reloadPreview, 1200); }
 }
 
 function toggleService() { service(svc === 'active' ? 'stop' : 'start'); }
@@ -495,6 +545,7 @@ async function load() {
   renderService(d.service || 'unknown');
   render(d.controls || []);
 }
+watchPreview();
 load();
 setInterval(pollService, 4000);
 </script></body></html>

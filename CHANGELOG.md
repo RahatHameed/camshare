@@ -6,6 +6,15 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Clicking start in the browser UI left a broken preview. systemd reports the
+  unit active the moment it forks, but gstreamer has not prerolled, so the
+  stream endpoint sent 200 headers and then no data — which a browser treats as
+  a permanently broken image and never retries. The endpoint now waits for real
+  frames before committing to a 200 and returns 503 otherwise, and the page
+  retries a bounded number of times while the service is meant to be running.
+
 ### Added
 
 - CI and license badges in the README.

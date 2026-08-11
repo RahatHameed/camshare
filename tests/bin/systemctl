@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Fake systemctl, so camtune's service controls can be tested without systemd.
+#
+# State lives in $FAKE_SVC_STATE. Only the verbs camtune uses are implemented.
+set -u
+
+STATE=${FAKE_SVC_STATE:?FAKE_SVC_STATE must be set}
+[ -s "$STATE" ] || echo inactive >"$STATE"
+
+# Drop --user and the unit name; neither changes behaviour here.
+verb=""
+for a in "$@"; do
+    case $a in
+        --user|--no-pager|-o|cat) continue ;;
+        *.service) continue ;;
+        *) [ -z "$verb" ] && verb=$a ;;
+    esac
+done
+
+case $verb in
+    is-active)
+        state=$(cat "$STATE")
+        echo "$state"
+        # The real tool exits non-zero when a unit is not active.
+        [ "$state" = active ] || exit 3
+        ;;
+    start|restart)
+        echo active >"$STATE"
+        ;;
+    stop)
+        echo inactive >"$STATE"
+        ;;
+    *)
+        echo "fake systemctl: unhandled verb '$verb'" >&2
+        exit 1
+        ;;
+esac

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Fake gst-launch-1.0, so camtune's preview endpoint can be tested without a
+# camera. Arguments are ignored; behaviour is chosen with FAKE_GST_MODE.
+#
+#   frames  emit a multipart MJPEG stream, as a working pipeline would
+#   silent  produce nothing and exit, which is what really happens when the
+#           loopback has no producer yet -- the window right after the fan-out
+#           is started, and the case that made "start" look like it did nothing
+set -u
+
+# Read from a file when one is given, so a test can flip the mode *after* the
+# server has started. An environment variable cannot: the server inherits its
+# own copy, and setting it on the curl process changes nothing.
+mode=${FAKE_GST_MODE:-frames}
+if [ -n "${FAKE_GST_MODE_FILE:-}" ] && [ -r "${FAKE_GST_MODE_FILE}" ]; then
+    mode=$(cat "$FAKE_GST_MODE_FILE")
+fi
+
+case $mode in
+    silent)
+        exit 1
+        ;;
+    frames)
+        i=0
+        while [ "$i" -lt 200 ]; do
+            i=$((i + 1))
+            printf -- '--camtune\r\nContent-Type: image/jpeg\r\nContent-Length: 8\r\n\r\nFRAME%03d\r\n' "$i"
+            sleep 0.05
+        done
+        ;;
+    *)
+        echo "fake gst: unknown FAKE_GST_MODE" >&2
+        exit 2
+        ;;
+esac
