@@ -3,16 +3,26 @@
 [![ci](https://github.com/RahatHameed/camshare/actions/workflows/ci.yml/badge.svg)](https://github.com/RahatHameed/camshare/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Use one webcam in several apps at the same time, on Linux.**
+**Take control of your webcam on Linux: share it between apps, and make it look
+the way you want.**
 
-Slack and Teams cannot both open your webcam. Whoever starts first wins; everyone
-else greys out the camera button or reports `Device or resource busy`. camshare
-reads the camera once and copies the frames into virtual cameras — one per app —
-so there is no contention.
+Two problems, one tool.
 
-It also fixes the *other* webcam annoyance: exposure and white balance that reset
-every time you replug, and a camera that meters for the bright window behind you
-and leaves your face in shadow.
+**Sharing.** Slack and Teams cannot both open your webcam. Whoever starts first
+wins; everyone else greys out the camera button or reports `Device or resource
+busy`. camshare reads the camera once and copies the frames into virtual cameras
+— one per app — so there is no contention.
+
+**Looking right.** Webcams meter for the bright window behind you and leave your
+face in shadow, drift in colour as you move, and forget every setting the moment
+you replug. camshare gives you named lighting profiles, per-control overrides,
+and a browser UI with a live preview to tune against — all applied instantly,
+without restarting anything, and reapplied automatically after a reboot or
+replug.
+
+If you only want the second half, that works too: point it at your camera, use
+one virtual device, and you have a webcam whose exposure and white balance stay
+where you put them.
 
 ```
                       ┌──> /dev/video70   "CamShare A"  ──> Slack
@@ -26,6 +36,18 @@ make install-system   # udev rule + kernel module options (sudo, once)
 make install          # scripts + a systemd user service
 make tune             # live preview and sliders in your browser
 ```
+
+### What you get
+
+| | |
+|---|---|
+| **Several apps, one camera** | as many virtual cameras as you configure, each with its own label |
+| **Lighting profiles** | `camlight day` / `evening` / your own, applied live, mid-call |
+| **Per-control overrides** | `camlight set exposure=800 wb=4200`, layered on a profile and saved |
+| **Browser tuning UI** | live preview, a slider per control, start/stop the service |
+| **Survives replugs** | settings reapplied automatically; cameras keep stable names |
+| **Diagnostics** | `make check` covers devices, holders, caps, USB link and CPU |
+| **Tested** | 45 assertions against a fake camera, no hardware needed |
 
 ---
 
@@ -253,6 +275,14 @@ make tune           # then open http://127.0.0.1:8787
 Live preview with a slider per control. The point is iteration speed: from the
 CLI, tuning means set → snapshot → look → adjust, several seconds a round. Here
 the preview updates as you drag.
+
+It also carries a **status pill and start/stop buttons** for the fan-out service.
+That is the answer to "why is my camera light on when I am not in a meeting?" —
+camshare holds the camera open continuously by design, so that apps cannot steal
+the real device, and stopping it releases the camera and turns the light off. The
+preview shades over with an explanation while it is stopped, since there is
+nothing to show. Note that apps *launched* while it is stopped will not list the
+virtual cameras at all.
 
 - **The preview reads a virtual camera, not the real one**, so it never contends
   with the fan-out and shows exactly the frames your apps receive.
