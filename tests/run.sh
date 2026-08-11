@@ -203,6 +203,10 @@ echo "camtune HTTP contract"
 setup
 export FAKE_SVC_STATE=$SANDBOX/svcstate
 export FAKE_GST_MODE_FILE=$SANDBOX/gstmode
+# The suite must not depend on the caller's environment: with the production
+# 12s budget the server would still be retrying when curl gives up, and the
+# assertion would see 000 instead of 503.
+export CAMTUNE_FIRST_FRAME_TIMEOUT=2
 echo active >"$FAKE_SVC_STATE"
 echo frames >"$FAKE_GST_MODE_FILE"
 
