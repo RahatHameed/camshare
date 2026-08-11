@@ -16,7 +16,7 @@
 # scripts awkward to test.
 declare -A _CAMSHARE_ENV=()
 for _k in CAM_VENDOR CAM_PRODUCT CAM_SERIAL CAM_LINK LOOPBACKS \
-          WIDTH HEIGHT FPS TUNE_PORT DEFAULT_PROFILE; do
+          WIDTH HEIGHT FPS TUNE_PORT DEFAULT_PROFILE STICKY_CONTROLS; do
     [ -n "${!_k+set}" ] && _CAMSHARE_ENV[$_k]=${!_k}
 done
 unset _k
@@ -32,6 +32,7 @@ HEIGHT=${HEIGHT:-1080}
 FPS=${FPS:-30}
 TUNE_PORT=${TUNE_PORT:-8787}
 DEFAULT_PROFILE=${DEFAULT_PROFILE:-auto}
+STICKY_CONTROLS=${STICKY_CONTROLS:-power_line_frequency}
 PROFILE_day=${PROFILE_day:-128 250 5000 1 0}
 PROFILE_evening=${PROFILE_evening:-140 500 3800 1 0}
 PROFILE_auto=${PROFILE_auto:-128 39 4500 3 1}
@@ -124,6 +125,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             echo "default:   $DEFAULT_PROFILE"
             echo "loopbacks: $(camshare_count)"
             camshare_loopbacks | while read -r n l; do echo "  /dev/video$n  $l"; done
+            # Printed so that a config edit which silently drops tuned profile
+            # values is visible here rather than only in the picture.
+            echo "profiles:"
+            camshare_profiles | while read -r p; do
+                printf '  %-10s %s\n' "$p" "$(camshare_profile "$p")"
+            done
             ;;
         *) echo "usage: camshare-conf {path|cam|devices|numbers|labels|count|loopbacks|profile NAME|get KEY|dump}" >&2
            exit 2 ;;

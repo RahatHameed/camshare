@@ -39,6 +39,14 @@ jobs:
           pip install ruff
           ruff check --select E9,F63,F7,F82 bin/camtune
 
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run test suite
+        run: ./tests/run.sh
+
   config:
     name: config + generators
     runs-on: ubuntu-latest

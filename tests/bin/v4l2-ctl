@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# A fake v4l2-ctl, so camlight can be tested without a camera.
+#
+# It deliberately reproduces the real tool's awkward behaviours, because those
+# are what the code has to cope with and what the tests exist to pin down:
+#
+#   * out-of-range values are CLAMPED SILENTLY and still exit 0
+#   * writing a control gated by an auto_* fails with a permission error
+#   * gated controls report "flags=inactive" rather than disappearing
+#
+# State lives in $FAKE_CAM_STATE so a test can inspect and seed it.
+set -uo pipefail
+
+STATE=${FAKE_CAM_STATE:?FAKE_CAM_STATE must be set}
+
+# name|type|min|max|default|gate_control|gate_active_value
+# A control with a gate is inactive unless that control holds the given value.
+SPEC='
+brightness|int|0|255|128||
+contrast|int|0|255|128||
+saturation|int|0|255|128||
+hue|int|0|255|128||
+white_balance_automatic|bool|0|1|1||
+power_line_frequency|menu|0|2|0||
+white_balance_temperature|int|2300|6500|4500|white_balance_automatic|0
+sharpness|int|0|255|128||
+auto_exposure|menu|0|3|3||
+exposure_time_absolute|int|1|1000|39|auto_exposure|1
+focus_absolute|int|450|800|500|focus_automatic_continuous|0
+focus_automatic_continuous|bool|0|1|1||
+zoom_absolute|int|100|400|100||
+'
+
+spec_line() { grep "^$1|" <<<"$SPEC"; }
+
+init_state() {
+    [ -s "$STATE" ] && return 0
+    local name rest def
+    : >"$STATE"
+    while IFS='|' read -r name _ _ _ def _ _; do
+        [ -n "$name" ] || continue
+        echo "$name $def" >>"$STATE"
+    done <<<"$SPEC"
+}
+
+value_of() {
+    local v
+    v=$(awk -v n="$1" '$1 == n {print $2}' "$STATE")
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    IFS='|' read -r _ _ _ _ v _ _ < <(spec_line "$1")
+    printf '%s' "$v"
+}
+
+set_value() {
+    local name=$1 val=$2
+    if grep -q "^$name " "$STATE"; then
+        sed -i "s|^$name .*|$name $val|" "$STATE"
+    else
+        echo "$name $val" >>"$STATE"
+    fi
+}
+
+is_active() {
+    local gate active
+    IFS='|' read -r _ _ _ _ _ gate active < <(spec_line "$1")
+    [ -n "$gate" ] || return 0
+    [ "$(value_of "$gate")" = "$active" ]
+}
+
+init_state
+
+# -d/--device is accepted and ignored: these tests do not care which node.
+args=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        -d|--device) shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+
+for arg in "${args[@]}"; do
+    case $arg in
+    --list-ctrls|--list-ctrls-menus)
+        while IFS='|' read -r name type min max def gate active; do
+            [ -n "$name" ] || continue
+            flags=""
+            is_active "$name" || flags=" flags=inactive"
+            val=$(value_of "$name")
+            if [ "$type" = bool ]; then
+                printf '%30s 0x%08x (bool)   : default=%s value=%s%s\n' \
+                    "$name" $((0x00980900 + RANDOM % 100)) "$def" "$val" "$flags"
+            else
+                printf '%30s 0x%08x (%s)   : min=%s max=%s step=1 default=%s value=%s%s\n' \
+                    "$name" $((0x00980900 + RANDOM % 100)) "$type" "$min" "$max" "$def" "$val" "$flags"
+            fi
+            if [ "$arg" = --list-ctrls-menus ] && [ "$type" = menu ]; then
+                local_i=$min
+                while [ "$local_i" -le "$max" ]; do
+                    printf '\t\t\t\t%s: option %s\n' "$local_i" "$local_i"
+                    local_i=$((local_i + 1))
+                done
+            fi
+        done <<<"$SPEC"
+        ;;
+    --get-ctrl=*)
+        IFS=, read -ra names <<<"${arg#--get-ctrl=}"
+        for n in "${names[@]}"; do
+            spec_line "$n" >/dev/null || { echo "unknown control $n" >&2; exit 1; }
+            printf '%s: %s\n' "$n" "$(value_of "$n")"
+        done
+        ;;
+    --set-ctrl=*)
+        IFS=, read -ra pairs <<<"${arg#--set-ctrl=}"
+        rc=0
+        for p in "${pairs[@]}"; do
+            n=${p%%=*}; v=${p#*=}
+            if ! IFS='|' read -r _ type min max _ _ _ < <(spec_line "$n"); then
+                echo "unknown control $n" >&2; rc=1; continue
+            fi
+            [ -n "${type:-}" ] || { echo "unknown control $n" >&2; rc=1; continue; }
+            if ! is_active "$n"; then
+                # What the real tool does when an auto_* gates the control.
+                echo "Error setting controls: Permission denied" >&2
+                echo "VIDIOC_S_EXT_CTRLS: failed: Permission denied" >&2
+                rc=1; continue
+            fi
+            [ "$type" = bool ] && { min=0; max=1; }
+            # The quirk that matters: clamp, do not fail.
+            [ "$v" -lt "$min" ] 2>/dev/null && v=$min
+            [ "$v" -gt "$max" ] 2>/dev/null && v=$max
+            set_value "$n" "$v"
+        done
+        exit $rc
+        ;;
+    --info)
+        echo "Driver Info:"
+        echo "	Device Caps      : 0x05200001"
+        echo "		Video Capture"
+        ;;
+    *) ;;
+    esac
+done

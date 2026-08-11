@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Test suite. Runs against tests/bin/v4l2-ctl, a fake camera, so it needs no
+# hardware and works in CI.
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+export PATH="$ROOT/tests/bin:$PATH"
+
+PASS=0
+FAIL=0
+
+ok()   { PASS=$((PASS + 1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
+bad()  { FAIL=$((FAIL + 1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; [ -n "${2:-}" ] && printf '         %s\n' "$2"; }
+
+is()   { # is <description> <actual> <expected>
+    if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected '$3', got '$2'"; fi
+}
+
+# Fresh sandbox per test: state file, config, fake device node, camlight state.
+setup() {
+    SANDBOX=$(mktemp -d)
+    export FAKE_CAM_STATE=$SANDBOX/camstate
+    export CAMLIGHT_STATE_DIR=$SANDBOX/state
+    export CAM=$SANDBOX/fakecam
+    : >"$FAKE_CAM_STATE"
+    : >"$CAM"
+    mkdir -p "$CAMLIGHT_STATE_DIR"
+
+    export CAMSHARE_CONF=$SANDBOX/camshare.conf
+    cat >"$CAMSHARE_CONF" <<'EOF'
+CAM_VENDOR="1234"
+CAM_PRODUCT="5678"
+CAM_LINK="testcam"
+LOOPBACKS="70:Test A;71:Test B"
+WIDTH=1280
+HEIGHT=720
+FPS=30
+STICKY_CONTROLS="power_line_frequency"
+PROFILE_day="128 600 5500 1 0"
+PROFILE_evening="140 900 3800 1 0"
+PROFILE_auto="128 39 4500 3 1"
+DEFAULT_PROFILE="day"
+EOF
+}
+
+teardown() { rm -rf "$SANDBOX"; }
+
+camlight() { "$ROOT/bin/camlight" "$@"; }
+getc()     { v4l2-ctl -d "$CAM" --get-ctrl="$1" | awk '{print $2}'; }
+
+echo
+echo "camshare tests"
+echo
+
+# ---------------------------------------------------------------------------
+echo "profiles"
+setup
+camlight day >/dev/null 2>&1
+is "day sets brightness"          "$(getc brightness)" "128"
+is "day sets manual exposure"     "$(getc auto_exposure)" "1"
+is "day sets exposure value"      "$(getc exposure_time_absolute)" "600"
+is "day disables auto white bal"  "$(getc white_balance_automatic)" "0"
+is "day sets white balance"       "$(getc white_balance_temperature)" "5500"
+
+camlight evening >/dev/null 2>&1
+is "evening changes brightness"   "$(getc brightness)" "140"
+is "evening changes exposure"     "$(getc exposure_time_absolute)" "900"
+teardown
+
+# ---------------------------------------------------------------------------
+# The reported bug: a control no profile names survived every profile switch,
+# so a stray hue could not be undone short of replugging the camera.
+echo
+echo "profile switching resets controls it does not name (regression)"
+setup
+camlight day >/dev/null 2>&1
+v4l2-ctl -d "$CAM" --set-ctrl=hue=145,saturation=160,zoom_absolute=140 >/dev/null 2>&1
+is "hue was changed"              "$(getc hue)" "145"
+
+camlight evening >/dev/null 2>&1
+is "hue reset by profile switch"        "$(getc hue)" "128"
+is "saturation reset by profile switch" "$(getc saturation)" "128"
+is "zoom reset by profile switch"       "$(getc zoom_absolute)" "100"
+is "profile value still applied"        "$(getc brightness)" "140"
+
+v4l2-ctl -d "$CAM" --set-ctrl=hue=200 >/dev/null 2>&1
+camlight reset >/dev/null 2>&1
+is "hue reset by 'reset'"               "$(getc hue)" "128"
+teardown
+
+# ---------------------------------------------------------------------------
+echo
+echo "sticky controls survive a profile switch"
+setup
+v4l2-ctl -d "$CAM" --set-ctrl=power_line_frequency=1 >/dev/null 2>&1
+camlight day >/dev/null 2>&1
+is "power_line_frequency kept" "$(getc power_line_frequency)" "1"
+camlight evening >/dev/null 2>&1
+is "still kept after 2nd switch" "$(getc power_line_frequency)" "1"
+teardown
+
+# ---------------------------------------------------------------------------
+echo
+echo "set: validation"
+setup
+camlight day >/dev/null 2>&1
+out=$(camlight set brightness=999 2>&1); rc=$?
+is "out-of-range rejected"        "$rc" "1"
+case $out in *"between 0 and 255"*) ok "error names the range" ;;
+             *) bad "error names the range" "$out" ;; esac
+is "clamping did not happen"      "$(getc brightness)" "128"
+is "nothing persisted"            "$([ -e "$CAMLIGHT_STATE_DIR/custom" ] && echo yes || echo no)" "no"
+
+camlight set nonsense=1 >/dev/null 2>&1
+is "unknown control rejected"     "$?" "1"
+camlight set brightness=abc >/dev/null 2>&1
+is "non-integer rejected"         "$?" "1"
+teardown
+
+# ---------------------------------------------------------------------------
+echo
+echo "set: applying and persisting"
+setup
+camlight day >/dev/null 2>&1
+camlight set sharpness=150 >/dev/null 2>&1
+is "value applied"                "$(getc sharpness)" "150"
+is "custom layer written"         "$([ -e "$CAMLIGHT_STATE_DIR/custom" ] && echo yes || echo no)" "yes"
+is "base profile unchanged"       "$(cat "$CAMLIGHT_STATE_DIR/profile")" "day"
+
+camlight reset >/dev/null 2>&1
+is "reset drops the tweak"        "$(getc sharpness)" "128"
+is "custom layer removed"         "$([ -e "$CAMLIGHT_STATE_DIR/custom" ] && echo yes || echo no)" "no"
+teardown
+
+# ---------------------------------------------------------------------------
+echo
+echo "set: auto_* gating"
+setup
+camlight auto >/dev/null 2>&1
+is "auto profile leaves AE on"    "$(getc auto_exposure)" "3"
+camlight set exposure=800 >/dev/null 2>&1
+is "setting exposure turns AE off" "$(getc auto_exposure)" "1"
+is "exposure took effect"          "$(getc exposure_time_absolute)" "800"
+
+camlight auto >/dev/null 2>&1
+camlight set exposure=500 ae=3 >/dev/null 2>&1; rc=$?
+is "explicit auto wins, exits 0"   "$rc" "0"
+is "auto_exposure stayed on"       "$(getc auto_exposure)" "3"
+teardown
+
+# ---------------------------------------------------------------------------
+echo
+echo "restore reapplies saved state"
+setup
+camlight day >/dev/null 2>&1
+camlight set sharpness=90 >/dev/null 2>&1
+# Simulate a replug: the camera comes back at factory defaults.
+: >"$FAKE_CAM_STATE"
+is "camera reset to defaults"      "$(getc sharpness)" "128"
+camlight restore >/dev/null 2>&1
+is "restore brings back the tweak" "$(getc sharpness)" "90"
+is "restore brings back profile"   "$(getc exposure_time_absolute)" "600"
+teardown
+
+# ---------------------------------------------------------------------------
+echo
+echo "config and generators"
+setup
+is "env overrides the config file" \
+   "$(CAM_LINK=fromenv "$ROOT/bin/camshare-conf" cam)" "/dev/fromenv"
+is "loopback count"                "$("$ROOT/bin/camshare-conf" count)" "2"
+is "device list"                   "$("$ROOT/bin/camshare-conf" devices | tr '\n' ' ')" "/dev/video70 /dev/video71 "
+is "profiles enumerated"           "$("$ROOT/bin/camshare-conf" profiles | tr '\n' ' ')" "auto day evening "
+
+udev=$("$ROOT/bin/camgen" udev)
+case $udev in *'SYMLINK+="testcam"'*) ok "udev rule names the symlink" ;;
+              *) bad "udev rule names the symlink" "$udev" ;; esac
+case $udev in *'ATTR{index}=="0"'*) ok "udev rule pins index 0" ;;
+              *) bad "udev rule pins index 0" ;; esac
+# Only the rule line matters; the comment above it mentions "serial" too.
+rule=$(grep '^SUBSYSTEM' <<<"$udev")
+case $rule in *'ATTRS{serial}'*) bad "no serial clause when unset" "$rule" ;;
+              *) ok "no serial clause when unset" ;; esac
+rule=$(CAM_SERIAL=ABC123 "$ROOT/bin/camgen" udev | grep '^SUBSYSTEM')
+case $rule in *'ATTRS{serial}=="ABC123"'*) ok "serial clause added when set" ;;
+              *) bad "serial clause added when set" "$rule" ;; esac
+
+mp=$(LOOPBACKS="70:A;71:B;72:C" "$ROOT/bin/camgen" modprobe)
+case $mp in *"devices=3"*)            ok "modprobe device count" ;; *) bad "modprobe device count" "$mp" ;; esac
+case $mp in *"video_nr=70,71,72"*)    ok "modprobe video_nr" ;;    *) bad "modprobe video_nr" "$mp" ;; esac
+case $mp in *"exclusive_caps=1,1,1"*) ok "exclusive_caps per device" ;; *) bad "exclusive_caps per device" "$mp" ;; esac
+teardown
+
+# ---------------------------------------------------------------------------
+echo
+printf '%d passed, %d failed\n\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

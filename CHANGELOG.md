@@ -27,7 +27,9 @@ installable on any Linux box with a UVC camera.
 - Makefile with `detect`, `install`, `check`, `tune`, `fps`, `snapshot` and
   friends; `make` alone prints self-documenting help.
 - Configurable number of virtual cameras via `LOOPBACKS` in `camshare.conf`.
-- GitHub Actions CI running shellcheck and a Python compile check.
+- GitHub Actions CI running shellcheck, a Python compile check and the tests.
+- Test suite (`make test`) running against a fake `v4l2-ctl`, so it needs no
+  camera. The fake reproduces the real tool's silent clamping and auto-gating.
 - `make edit` to open the active config, and `make link`/`make unlink` to keep
   the config in the checkout symlinked into `~/.config`, for tracking it in a
   private fork. A dangling symlink is reported rather than silently falling back
@@ -48,6 +50,10 @@ installable on any Linux box with a UVC camera.
 - Loading the config overwrote settings passed in the environment, so
   `CAM_VENDOR=046d camgen udev` silently used the config's value instead. The
   environment now wins.
+- Applying a profile left controls it did not name wherever they happened to be,
+  so a stray hue, saturation or zoom survived every profile switch and `reset`
+  could not undo it. A profile now returns every control it manages to the
+  camera default, except those listed in `STICKY_CONTROLS`.
 - `camtune` refused to start if its port was in use. It now walks forward to the
   next free port, or takes any free port with `--port 0`.
 

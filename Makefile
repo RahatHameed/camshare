@@ -249,9 +249,14 @@ sync: ## Copy the live installed files back into this repo
 	@cp $(UNIT_DIR)/$(SERVICE) systemd/$(SERVICE)
 	@echo "repo updated from $(PREFIX) and $(UNIT_DIR)"
 
+.PHONY: test
+test: ## Run the test suite (uses a fake camera, no hardware needed)
+	@./tests/run.sh
+
 .PHONY: lint
 lint: ## Syntax-check the shell scripts and camtune
-	@for f in bin/camshare.sh bin/camlight bin/camdetect bin/camgen bin/camshare-conf; do \
+	@for f in bin/camshare.sh bin/camlight bin/camdetect bin/camgen bin/camshare-conf \
+	          tests/run.sh tests/bin/v4l2-ctl; do \
 	  bash -n $$f && echo "$$f OK"; done
 	@python3 -m py_compile bin/camtune && echo "bin/camtune OK"
 	@rm -rf bin/__pycache__

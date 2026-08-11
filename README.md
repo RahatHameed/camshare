@@ -134,6 +134,7 @@ actually resolved, and `make edit` opens it in `$EDITOR`.
 | `LOOPBACKS` | `number:label` per virtual camera, semicolon separated. |
 | `WIDTH`, `HEIGHT`, `FPS` | Capture format. Only sizes listed under MJPG by `make formats` are valid. |
 | `TUNE_PORT` | Port for the browser UI. Default 8787. |
+| `STICKY_CONTROLS` | Controls a profile switch must not reset to default. |
 | `PROFILE_<name>` | A lighting profile. Add your own; no code change needed. |
 | `DEFAULT_PROFILE` | Applied when nothing has been chosen yet. |
 
@@ -175,6 +176,14 @@ camlight evening
 camlight auto       # hand exposure and white balance back to the camera
 camlight status
 ```
+
+**Applying a profile puts the camera into a fully known state.** Controls the
+profile does not name — contrast, saturation, hue, sharpness, zoom, focus — go
+back to the camera's own defaults. Without that, a stray value set once (from a
+slider, say) survives every profile switch and there is no way back short of
+replugging. Anything you genuinely want to keep goes in `STICKY_CONTROLS`, which
+defaults to `power_line_frequency` because your mains frequency is a property of
+the room, not of how you want to look.
 
 Switching is **live** — UVC controls can be changed mid-stream — so it is safe
 during a call and needs no restart. The choice is saved and reapplied at service
@@ -291,7 +300,26 @@ Run `make` with no arguments for the full self-documenting list.
 | `set ARGS="brightness=150"` / `reset` / `controls` | manual control |
 | `tune` | browser UI |
 | `fps` / `snapshot` / `formats` | measure rate; grab a frame; list camera modes |
-| `diff` / `sync` / `lint` | repo vs installed; pull back; syntax checks |
+| `test` / `lint` | run the test suite; syntax + shellcheck |
+| `diff` / `sync` | repo vs installed; pull live edits back in |
+
+## Tests
+
+```bash
+make test
+```
+
+The suite runs against a fake `v4l2-ctl` in `tests/bin/`, so it needs no camera
+and runs in CI. The fake deliberately reproduces the real tool's awkward
+behaviours, because those are what the code has to cope with:
+
+- out-of-range values are **clamped silently** and still exit 0
+- writing a control gated by an `auto_*` fails with a permission error
+- gated controls report `flags=inactive` rather than disappearing
+
+45 assertions covering profile application, the reset-to-defaults semantics,
+sticky controls, `set` validation and persistence, auto gating, `restore` after
+a simulated replug, and the config and generator output.
 
 ## How it works
 
@@ -427,11 +455,11 @@ Measured while tuning a UGREEN FineCam 4K CM973. Details vary by camera, but the
   anything above 1080p rarely reaches the far end.
 - **Manual exposure does not follow the light.** A profile tuned at midday will
   be wrong after dark. Switch profiles, or use `auto`.
-- **Profiles manage five controls** — brightness, the two autos, exposure and
-  white balance. Anything else you change (contrast, saturation, sharpness,
-  zoom) sticks on the device but is not restored by switching profiles. Use
-  `camlight set` to save such values, and `camlight controls` to see what is
-  really set. Replugging the camera resets everything to factory defaults.
+- **A profile names five controls** — brightness, the two autos, exposure and
+  white balance. Everything else it manages is returned to the camera's default
+  when the profile is applied, so a profile switch always lands on a known
+  state. Controls listed in `STICKY_CONTROLS` are exempt. Use `camlight set` to
+  keep a non-profile value, and `camlight controls` to see what is really set.
 - **The fan-out is a single point of failure.** It owns the camera and feeds
   every virtual device; if it dies they all go dark. `Restart=always` covers
   crashes.

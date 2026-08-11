@@ -76,6 +76,13 @@ PROFILE_day="128 250 5000 1 0"
 PROFILE_evening="140 500 3800 1 0"
 PROFILE_auto="128 39 4500 3 1"
 
+# Controls a profile switch must NOT reset to the camera default. Applying a
+# profile otherwise returns every control it does not name to its default, so
+# that switching profiles always lands on a known state. power_line_frequency
+# belongs to your mains (50Hz in most of the world, 60Hz in the Americas), not
+# to how you want to look, so resetting it would reintroduce flicker.
+STICKY_CONTROLS="power_line_frequency"
+
 # Profile applied when nothing has been chosen yet, and by `camlight reset`.
 # "auto" is the safe default: it hands exposure and white balance to the camera,
 # which looks acceptable everywhere. Switch to "day" once you have tuned it.

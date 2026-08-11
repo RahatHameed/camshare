@@ -145,11 +145,34 @@ validate() {
     return 0
 }
 
-# Expand a named profile into control=value pairs. Controls gated by an auto that
-# the profile leaves on are omitted, since setting them would be a no-op.
+# Every control camlight manages, at the camera's own default value.
+#
+# A profile that only wrote its own five controls left everything else wherever
+# it happened to be, so a stray hue or zoom survived every profile switch and
+# there was no way back short of replugging the camera. Emitting defaults first
+# makes applying a profile land on a fully known state.
+#
+# STICKY_CONTROLS is exempt: power_line_frequency is a property of the room's
+# mains, not of how you want to look, and resetting it to "Disabled" would
+# reintroduce flicker.
+defaults_pairs() {
+    local known=" ${ORDER[*]} " sticky=" ${STICKY_CONTROLS:-} " name def
+    while read -r name def; do
+        [[ $known  == *" $name "* ]] || continue
+        [[ $sticky == *" $name "* ]] && continue
+        printf '%s=%s\n' "$name" "$def"
+    done < <(v4l2-ctl -d "$CAM" --list-ctrls 2>/dev/null |
+             sed -n 's/^[[:space:]]*\([a-z_]*\) 0x.*default=\(-\?[0-9]*\).*/\1 \2/p')
+}
+
+# Expand a named profile into control=value pairs. Defaults come first so the
+# profile's own values override them; later lines win in apply_pairs. Controls
+# gated by an auto that the profile leaves on are omitted, since setting them
+# would be a no-op.
 profile_pairs() {
     local b e wb ae awb
     read -r b e wb ae awb < <(lookup "$1")
+    defaults_pairs
     echo "brightness=$b"
     echo "auto_exposure=$ae"
     [ "$ae" = 1 ]  && echo "exposure_time_absolute=$e"
