@@ -44,6 +44,10 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `make cameras`: lists real and virtual cameras with their formats and whether
+  something is reading them, filtering out the unusable IPU6 nodes that bury
+  `v4l2-ctl --list-devices` on this kind of laptop.
+
 - `TUNE_LOOPBACK`: a virtual camera used only by camtune's preview, so the
   tuning UI never shares a loopback with an application. Sharing one made the
   app go blank while the preview looked fine. A missing preview device is a

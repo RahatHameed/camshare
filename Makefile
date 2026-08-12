@@ -236,6 +236,24 @@ snapshot: ## Grab a frame off a virtual camera (no contention with the apps)
 	@f=$$(ls $(SNAP_DIR)/snap_*.jpg | tail -1); mv "$$f" $(SNAP_DIR)/latest.jpg; rm -f $(SNAP_DIR)/snap_*.jpg
 	@echo "wrote $(SNAP_DIR)/latest.jpg"
 
+.PHONY: cameras
+cameras: ## List every usable camera: real, virtual, and who is using them
+	@echo "real cameras (USB):"
+	@./bin/camdetect --list 2>/dev/null | tail -n +2 | sed 's/^/ /' || echo "  none found"
+	@echo
+	@echo "virtual cameras:"
+	@$(CONFQ) loopbacks | while read -r n l; do \
+	  d=/dev/video$$n; \
+	  if [ ! -e "$$d" ]; then printf '  %-14s %-18s MISSING\n' "$$d" "$$l"; continue; fi; \
+	  fmt=$$(v4l2-ctl -d $$d --get-fmt-video 2>/dev/null | sed -n "s|.*Width/Height *: *||p"); \
+	  who=$$(fuser $$d 2>/dev/null | tr -s ' ' | sed 's/^ //'); \
+	  n_readers=$$(echo $$who | wc -w); \
+	  printf '  %-14s %-18s %-12s %s\n' "$$d" "$$l" "$${fmt:-no signal}" \
+	    "$$([ "$$n_readers" -gt 1 ] && echo "in use" || echo "free")"; \
+	done
+	@echo
+	@echo "(built-in laptop cameras on Intel IPU6 are not UVC and cannot be shared)"
+
 .PHONY: formats
 formats: ## List the resolutions and frame rates the camera supports
 	@v4l2-ctl -d $(CAM) --list-formats-ext

@@ -377,6 +377,7 @@ Run `make` with no arguments for the full self-documenting list.
 | `day` / `evening` / `auto` / `light` | lighting profiles |
 | `set ARGS="brightness=150"` / `reset` / `controls` | manual control |
 | `tune` | browser UI |
+| `cameras` | list every usable camera: real, virtual, and which are in use |
 | `fps` / `snapshot` / `formats` | measure rate; grab a frame; list camera modes |
 | `test` / `lint` | run the test suite; syntax + shellcheck |
 | `diff` / `sync` | repo vs installed; pull live edits back in |
@@ -398,6 +399,29 @@ behaviours, because those are what the code has to cope with:
 45 assertions covering profile application, the reset-to-defaults semantics,
 sticky controls, `set` validation and persistence, auto gating, `restore` after
 a simulated replug, and the config and generator output.
+
+## Listing cameras
+
+```bash
+make cameras
+```
+
+```
+real cameras (USB):
+   1) /dev/video0    UGREEN FineCam 4K CM973: UGREEN
+      a108:2240  serial Ucamera001
+
+virtual cameras:
+  /dev/video70   CamShare Slack     1920/1080    free
+  /dev/video71   CamShare Teams     1920/1080    in use
+  /dev/video79   CamShare WebTune   1920/1080    free
+```
+
+`v4l2-ctl --list-devices` is the underlying tool, but on a laptop with an Intel
+IPU6 camera stack it buries the useful entries under ~48 unusable nodes. This
+filters to what can actually be used, and shows whether something is reading
+each virtual camera — handy when an app has gone blank, since only one reader
+per virtual camera is allowed.
 
 ## How it works
 
